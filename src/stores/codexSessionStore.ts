@@ -1,0 +1,719 @@
+import * as fs from "fs/promises";
+import * as os from "os";
+import * as path from "path";
+import * as vscode from "vscode";
+import { querySqlite, sqlString } from "./sqlite";
+import {
+  ArchiveFilter,
+  ConversationDetail,
+  ConversationMessage,
+  ConversationStore,
+  ConversationSummary
+} from "./types";
+
+interface SessionIndexEntry {
+  id?: string;
+  thread_name?: string;
+  title?: string;
+  updated_at?: string;
+}
+
+interface ThreadRow {
+  [key: string]: unknown;
+  id?: unknown;
+  title?: unknown;
+  preview?: unknown;
+  cwd?: unknown;
+  source?: unknown;
+  rollout_path?: unknown;
+  created_at?: unknown;
+  created_at_ms?: unknown;
+  updated_at?: unknown;
+  updated_at_ms?: unknown;
+  recency_at?: unknown;
+  recency_at_ms?: unknown;
+  archived?: unknown;
+  archived_at?: unknown;
+  first_user_message?: unknown;
+  agent_nickname?: unknown;
+  agent_role?: unknown;
+  thread_source?: unknown;
+}
+
+function expandHome(input: string): string {
+  if (input.startsWith("~/")) {
+    return path.join(os.homedir(), input.slice(2));
+  }
+  return input;
+}
+
+function asDate(value: unknown): Date | undefined {
+  if (value == null || value === "") {
+    return undefined;
+  }
+  if (value instanceof Date) {
+    return Number.isNaN(value.getTime()) ? undefined : value;
+  }
+  if (typeof value === "number" && Number.isFinite(value)) {
+    const ms = value > 1e12 ? value : value * 1000;
+    const parsed = new Date(ms);
+    return Number.isNaN(parsed.getTime()) ? undefined : parsed;
+  }
+  const text = String(value);
+  if (/^\d+$/.test(text)) {
+    return asDate(Number(text));
+  }
+  const parsed = new Date(text);
+  return Number.isNaN(parsed.getTime()) ? undefined : parsed;
+}
+
+function asString(value: unknown): string {
+  return value == null ? "" : String(value);
+}
+
+function isTruthyFlag(value: unknown): boolean {
+  if (typeof value === "boolean") {
+    return value;
+  }
+  if (typeof value === "number") {
+    return value !== 0;
+  }
+  const text = asString(value).trim().toLowerCase();
+  return text === "1" || text === "true";
+}
+
+function isRolloutName(name: string): boolean {
+  return name.startsWith("rollout-");
+}
+
+function titleFromPath(filePath: string): string {
+  return path.basename(filePath, path.extname(filePath));
+}
+
+function looksArchivedPath(filePath: string): boolean {
+  return filePath.split(path.sep).includes("archived_sessions");
+}
+
+function toActiveSessionPath(filePath: string): string {
+  const parts = filePath.split(path.sep);
+  const index = parts.lastIndexOf("archived_sessions");
+  if (index === -1) {
+    return filePath;
+  }
+  parts[index] = "sessions";
+  return parts.join(path.sep);
+}
+
+function toArchivedSessionPath(filePath: string): string {
+  const parts = filePath.split(path.sep);
+  if (parts.includes("archived_sessions")) {
+    return filePath;
+  }
+  const index = parts.lastIndexOf("sessions");
+  if (index === -1) {
+    return filePath;
+  }
+  parts[index] = "archived_sessions";
+  return parts.join(path.sep);
+}
+
+function isHiddenSource(source: string): boolean {
+  const normalized = source.trim().toLowerCase();
+  return (
+    normalized === "exec" ||
+    normalized.startsWith("subagent") ||
+    normalized.startsWith("internal")
+  );
+}
+
+function isInternalHistoryPrompt(text: string): boolean {
+  const value = text.trim();
+  if (!value) {
+    return false;
+  }
+  return (
+    value.includes("Codex agent history whose request action you are assessing") ||
+    value.startsWith("The following is the Codex agent history") ||
+    /^the following is the codex\b/i.test(value)
+  );
+}
+
+function isDisplayableTitle(title: string): boolean {
+  const value = title.trim();
+  return Boolean(value) && !isRolloutName(value) && !isInternalHistoryPrompt(value);
+}
+
+function isExplicitTitle(title: string, firstUserMessage?: string): boolean {
+  if (!isDisplayableTitle(title)) {
+    return false;
+  }
+  const firstMessage = firstUserMessage?.trim() ?? "";
+  return !(firstMessage && title.trim() === firstMessage);
+}
+
+export class CodexSessionStore implements ConversationStore {
+  constructor(private readonly getConfig = () => vscode.workspace.getConfiguration("codexChatManager")) {}
+
+  private codexHome(): string {
+    const configured = this.getConfig().get<string>("codexHome")?.trim();
+    return expandHome(configured || path.join(os.homedir(), ".codex"));
+  }
+
+  private sessionsDir(): string {
+    const configured = this.getConfig().get<string>("sessionsDir")?.trim();
+    return expandHome(configured || path.join(this.codexHome(), "sessions"));
+  }
+
+  private archivedDir(): string {
+    return path.join(this.codexHome(), "archived_sessions");
+  }
+
+  private indexFile(): string {
+    const configured = this.getConfig().get<string>("indexFile")?.trim();
+    return expandHome(configured || path.join(this.codexHome(), "session_index.jsonl"));
+  }
+
+  private stateDb(): string {
+    return path.join(this.codexHome(), "state_5.sqlite");
+  }
+
+  watchRoots(): string[] {
+    return [this.codexHome()];
+  }
+
+  async list(filter: ArchiveFilter = "all"): Promise<ConversationSummary[]> {
+    const titles = await this.loadIndexTitles();
+    let items = await this.listFromSqlite(titles);
+    if (items.length === 0) {
+      items = await this.listFromFilesystem(titles);
+    }
+    return this.sort(items.filter((item) => this.matchesFilter(item, filter)));
+  }
+
+  async get(id: string): Promise<ConversationDetail | undefined> {
+    const summaries = await this.list("all");
+    const summary = summaries.find((item) => item.id === id);
+    if (!summary) {
+      return undefined;
+    }
+    return {
+      summary,
+      messages: await this.readMessages(summary.sourcePath)
+    };
+  }
+
+  async delete(id: string): Promise<void> {
+    const summary = (await this.list("all")).find((item) => item.id === id);
+    const ids = await this.collectRelatedThreadIds(id);
+    if (summary) {
+      ids.add(summary.id);
+    } else {
+      ids.add(id);
+    }
+
+    const files = new Set<string>();
+    if (summary?.sourcePath) {
+      files.add(summary.sourcePath);
+    }
+    for (const threadId of ids) {
+      for (const filePath of await this.findRolloutFiles(threadId)) {
+        files.add(filePath);
+      }
+    }
+
+    for (const filePath of files) {
+      await this.safeUnlink(filePath);
+    }
+    for (const threadId of ids) {
+      await this.removeIndexEntries(threadId);
+      await this.deleteSqliteThread(threadId);
+    }
+  }
+
+  async unarchive(id: string): Promise<void> {
+    const summary = (await this.list("all")).find((item) => item.id === id);
+    if (!summary) {
+      throw new Error("未找到该对话。");
+    }
+    if (!summary.archived) {
+      return;
+    }
+    const restoredPath = await this.relocateSessionFiles(id, summary.sourcePath, false);
+    await this.setSqliteArchived(id, restoredPath, false);
+  }
+
+  async archive(id: string): Promise<void> {
+    const summary = (await this.list("all")).find((item) => item.id === id);
+    if (!summary) {
+      throw new Error("未找到该对话。");
+    }
+    if (summary.archived) {
+      return;
+    }
+    const archivedPath = await this.relocateSessionFiles(id, summary.sourcePath, true);
+    await this.setSqliteArchived(id, archivedPath, true);
+  }
+
+  private async relocateSessionFiles(id: string, sourcePath: string, archived: boolean): Promise<string> {
+    const files = [...new Set([...(await this.findRolloutFiles(id)), sourcePath].filter(Boolean))];
+    let result = sourcePath;
+    for (const filePath of files) {
+      const destination = archived ? toArchivedSessionPath(filePath) : toActiveSessionPath(filePath);
+      if (destination === filePath) {
+        result = filePath;
+        continue;
+      }
+      await fs.mkdir(path.dirname(destination), { recursive: true });
+      try {
+        await fs.rename(filePath, destination);
+        result = destination;
+      } catch (error) {
+        const err = error as NodeJS.ErrnoException;
+        if (err.code !== "ENOENT") {
+          throw error;
+        }
+      }
+    }
+    return result;
+  }
+
+  private async collectRelatedThreadIds(rootId: string): Promise<Set<string>> {
+    const ids = new Set<string>([rootId]);
+    const dbPath = this.stateDb();
+    try {
+      await fs.access(dbPath);
+    } catch {
+      return ids;
+    }
+
+    let rows: Record<string, unknown>[] = [];
+    try {
+      rows = await querySqlite<Record<string, unknown>>(
+        dbPath,
+        `SELECT parent_thread_id, child_thread_id FROM thread_spawn_edges`
+      );
+    } catch {
+      return ids;
+    }
+
+    const children = new Map<string, string[]>();
+    for (const row of rows) {
+      const parent = asString(row.parent_thread_id).trim();
+      const child = asString(row.child_thread_id).trim();
+      if (!parent || !child) {
+        continue;
+      }
+      const list = children.get(parent) ?? [];
+      list.push(child);
+      children.set(parent, list);
+    }
+
+    const queue = [rootId];
+    while (queue.length > 0) {
+      const current = queue.pop();
+      if (!current) {
+        continue;
+      }
+      for (const child of children.get(current) ?? []) {
+        if (!ids.has(child)) {
+          ids.add(child);
+          queue.push(child);
+        }
+      }
+    }
+    return ids;
+  }
+
+  private async findRolloutFiles(threadId: string): Promise<string[]> {
+    const matches: string[] = [];
+    for (const root of [this.sessionsDir(), this.archivedDir()]) {
+      for (const filePath of await this.collectSessionFiles(root)) {
+        if (filePath.includes(threadId) || this.idFromPath(filePath) === threadId) {
+          matches.push(filePath);
+        }
+      }
+    }
+    return matches;
+  }
+
+  private matchesFilter(item: ConversationSummary, filter: ArchiveFilter): boolean {
+    if (filter === "archived") {
+      return item.archived;
+    }
+    if (filter === "active") {
+      return !item.archived;
+    }
+    return true;
+  }
+
+  private async listFromSqlite(titles: Map<string, string>): Promise<ConversationSummary[]> {
+    const dbPath = this.stateDb();
+    try {
+      await fs.access(dbPath);
+    } catch {
+      return [];
+    }
+
+    let rows: ThreadRow[] = [];
+    try {
+      rows = await querySqlite<ThreadRow>(dbPath, `SELECT * FROM threads`);
+    } catch {
+      return [];
+    }
+
+    const childIds = await this.loadSpawnChildIds(dbPath);
+    const items: ConversationSummary[] = [];
+    for (const row of rows) {
+      const summary = this.rowToSummary(row, titles);
+      if (summary && this.isUserFacing(summary, row) && !childIds.has(summary.id)) {
+        items.push(summary);
+      }
+    }
+    return items;
+  }
+
+  private async loadSpawnChildIds(dbPath: string): Promise<Set<string>> {
+    try {
+      const rows = await querySqlite<Record<string, unknown>>(
+        dbPath,
+        `SELECT child_thread_id FROM thread_spawn_edges`
+      );
+      return new Set(rows.map((row) => asString(row.child_thread_id).trim()).filter(Boolean));
+    } catch {
+      return new Set();
+    }
+  }
+
+  private rowToSummary(row: ThreadRow, titles: Map<string, string>): ConversationSummary | undefined {
+    const id = asString(row.id).trim();
+    const sourcePath = asString(row.rollout_path).trim();
+    if (!id || !sourcePath) {
+      return undefined;
+    }
+
+    const indexedTitle = titles.get(id);
+    const dbTitle = asString(row.title).trim();
+    const firstUserMessage = asString(row.first_user_message).trim();
+    const preview = asString(row.preview).trim() || firstUserMessage;
+    const title = this.pickTitle(indexedTitle, dbTitle, firstUserMessage || preview, sourcePath);
+    const archived =
+      isTruthyFlag(row.archived) || Boolean(asString(row.archived_at).trim()) || looksArchivedPath(sourcePath);
+
+    return {
+      id,
+      title,
+      preview,
+      cwd: asString(row.cwd) || undefined,
+      source: asString(row.source) || undefined,
+      sourcePath,
+      archived,
+      createdAt: asDate(row.created_at_ms ?? row.created_at),
+      updatedAt: asDate(row.recency_at_ms ?? row.recency_at ?? row.updated_at_ms ?? row.updated_at)
+    };
+  }
+
+  private isUserFacing(summary: ConversationSummary, row?: ThreadRow): boolean {
+    if (asString(row?.agent_nickname).trim() || asString(row?.agent_role).trim()) {
+      return false;
+    }
+    if (isHiddenSource(summary.source || asString(row?.source)) || isHiddenSource(asString(row?.thread_source))) {
+      return false;
+    }
+    if (isInternalHistoryPrompt(summary.title) || isInternalHistoryPrompt(summary.preview ?? "")) {
+      return false;
+    }
+    if (isExplicitTitle(summary.title, asString(row?.first_user_message))) {
+      return true;
+    }
+    const preview = (summary.preview || asString(row?.first_user_message)).trim();
+    return Boolean(preview) && !isInternalHistoryPrompt(preview);
+  }
+
+  private async listFromFilesystem(titles: Map<string, string>): Promise<ConversationSummary[]> {
+    const active = await this.collectSessionFiles(this.sessionsDir());
+    const archived = await this.collectSessionFiles(this.archivedDir());
+    const items: ConversationSummary[] = [];
+
+    for (const filePath of active) {
+      items.push(await this.fileToSummary(filePath, false, titles));
+    }
+    for (const filePath of archived) {
+      items.push(await this.fileToSummary(filePath, true, titles));
+    }
+
+    return items.filter((item) => this.isUserFacing(item));
+  }
+
+  private async fileToSummary(
+    filePath: string,
+    archived: boolean,
+    titles: Map<string, string>
+  ): Promise<ConversationSummary> {
+    const id = this.idFromPath(filePath);
+    const stat = await fs.stat(filePath);
+    const indexedTitle = titles.get(id);
+    return {
+      id,
+      title: this.pickTitle(indexedTitle, undefined, undefined, filePath),
+      cwd: undefined,
+      sourcePath: filePath,
+      archived: archived || looksArchivedPath(filePath),
+      createdAt: stat.birthtime,
+      updatedAt: stat.mtime
+    };
+  }
+
+  private idFromPath(filePath: string): string {
+    const name = titleFromPath(filePath);
+    const match = name.match(/[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}/i);
+    return match?.[0] ?? filePath;
+  }
+
+  private pickTitle(
+    indexedTitle: string | undefined,
+    dbTitle: string | undefined,
+    firstUserMessage: string | undefined,
+    sourcePath: string
+  ): string {
+    const candidates = [indexedTitle, dbTitle, firstUserMessage].map((value) => value?.trim() ?? "");
+    for (const candidate of candidates) {
+      if (isDisplayableTitle(candidate)) {
+        return candidate.split(/\r?\n/, 1)[0].slice(0, 80);
+      }
+    }
+    return titleFromPath(sourcePath);
+  }
+
+  private async loadIndexTitles(): Promise<Map<string, string>> {
+    const titles = new Map<string, string>();
+    let raw: string;
+    try {
+      raw = await fs.readFile(this.indexFile(), "utf8");
+    } catch {
+      return titles;
+    }
+
+    for (const line of raw.split(/\r?\n/)) {
+      if (!line.trim()) {
+        continue;
+      }
+      try {
+        const entry = JSON.parse(line) as SessionIndexEntry;
+        const id = entry.id?.trim();
+        const name = (entry.thread_name || entry.title || "").trim();
+        if (id && isDisplayableTitle(name)) {
+          titles.set(id, name);
+        }
+      } catch {
+        // 跳过损坏的索引行
+      }
+    }
+    return titles;
+  }
+
+  private async collectSessionFiles(root: string): Promise<string[]> {
+    const results: string[] = [];
+    let entries;
+    try {
+      entries = await fs.readdir(root, { withFileTypes: true });
+    } catch {
+      return [];
+    }
+
+    for (const entry of entries) {
+      const fullPath = path.join(root, entry.name);
+      if (entry.isDirectory()) {
+        results.push(...(await this.collectSessionFiles(fullPath)));
+      } else if (entry.isFile() && (entry.name.endsWith(".jsonl") || entry.name.endsWith(".json"))) {
+        results.push(fullPath);
+      }
+    }
+    return results;
+  }
+
+  private async readMessages(filePath: string): Promise<ConversationMessage[]> {
+    let raw: string;
+    try {
+      raw = await fs.readFile(filePath, "utf8");
+    } catch {
+      return [];
+    }
+
+    const messages: ConversationMessage[] = [];
+    for (const line of raw.split(/\r?\n/)) {
+      if (!line.trim()) {
+        continue;
+      }
+      try {
+        const parsed = JSON.parse(line) as Record<string, unknown>;
+        const message = this.normalizeMessage(parsed);
+        if (message) {
+          messages.push(message);
+        }
+      } catch {
+        // 跳过无法解析的行
+      }
+    }
+    return messages;
+  }
+
+  private normalizeMessage(record: Record<string, unknown>): ConversationMessage | undefined {
+    const type = String(record.type ?? record.kind ?? "");
+    if (type === "session_meta" || type === "turn_context" || type === "compacted") {
+      return undefined;
+    }
+
+    const payload = (record.payload ?? record.message ?? record) as Record<string, unknown>;
+    const payloadType = String(payload.type ?? "");
+    if (payloadType && payloadType !== "message" && payloadType !== "agent_message" && payloadType !== "user_message") {
+      if (type === "event_msg") {
+        return undefined;
+      }
+    }
+
+    const role = this.extractRole(record);
+    const content = this.extractContent(record);
+    if (!content) {
+      return undefined;
+    }
+
+    return {
+      role,
+      content,
+      timestamp: asDate(record.timestamp ?? record.created_at)
+    };
+  }
+
+  private extractRole(record: Record<string, unknown>): ConversationMessage["role"] {
+    const payload = (record.payload ?? record.message ?? record) as Record<string, unknown>;
+    const role = String(payload.role ?? record.role ?? "").toLowerCase();
+    if (role === "user" || role === "assistant" || role === "system" || role === "tool") {
+      return role;
+    }
+    const type = String(payload.type ?? record.type ?? "").toLowerCase();
+    if (type.includes("user")) {
+      return "user";
+    }
+    if (type.includes("agent") || type.includes("assistant")) {
+      return "assistant";
+    }
+    return "unknown";
+  }
+
+  private extractContent(record: Record<string, unknown>): string {
+    const payload = (record.payload ?? record.message ?? record) as Record<string, unknown>;
+    const content = payload.content ?? record.content ?? payload.text ?? record.text;
+    if (typeof content === "string") {
+      return content.trim();
+    }
+    if (Array.isArray(content)) {
+      return content
+        .map((part) => {
+          if (typeof part === "string") {
+            return part;
+          }
+          if (part && typeof part === "object" && "text" in part) {
+            return String((part as { text?: unknown }).text ?? "");
+          }
+          return "";
+        })
+        .join("\n")
+        .trim();
+    }
+    return "";
+  }
+
+  private async removeIndexEntries(id: string): Promise<void> {
+    const indexPath = this.indexFile();
+    let raw: string;
+    try {
+      raw = await fs.readFile(indexPath, "utf8");
+    } catch {
+      return;
+    }
+
+    const kept = raw
+      .split(/\r?\n/)
+      .filter((line) => {
+        if (!line.trim()) {
+          return false;
+        }
+        try {
+          const entry = JSON.parse(line) as SessionIndexEntry;
+          return entry.id !== id;
+        } catch {
+          return true;
+        }
+      })
+      .join("\n");
+
+    await fs.writeFile(indexPath, kept ? `${kept}\n` : "");
+  }
+
+  private async deleteSqliteThread(id: string): Promise<void> {
+    const dbPath = this.stateDb();
+    try {
+      await fs.access(dbPath);
+    } catch {
+      return;
+    }
+
+    const quoted = sqlString(id);
+    try {
+      await querySqlite(
+        dbPath,
+        `DELETE FROM thread_spawn_edges WHERE parent_thread_id = ${quoted} OR child_thread_id = ${quoted}`,
+        false
+      );
+    } catch {
+      // 旧库可能没有该表
+    }
+    await querySqlite(dbPath, `DELETE FROM threads WHERE id = ${quoted}`, false);
+  }
+
+  private async setSqliteArchived(id: string, rolloutPath: string, archived: boolean): Promise<void> {
+    const dbPath = this.stateDb();
+    try {
+      await fs.access(dbPath);
+    } catch {
+      return;
+    }
+
+    const quotedId = sqlString(id);
+    const quotedPath = sqlString(rolloutPath);
+    const archivedFlag = archived ? 1 : 0;
+    const archivedAt = archived ? "strftime('%s','now')" : "NULL";
+    try {
+      await querySqlite(
+        dbPath,
+        `UPDATE threads SET archived = ${archivedFlag}, archived_at = ${archivedAt}, rollout_path = ${quotedPath} WHERE id = ${quotedId}`,
+        false
+      );
+    } catch {
+      await querySqlite(
+        dbPath,
+        `UPDATE threads SET archived = ${archivedFlag}, rollout_path = ${quotedPath} WHERE id = ${quotedId}`,
+        false
+      );
+    }
+  }
+
+  private async safeUnlink(filePath: string): Promise<void> {
+    try {
+      await fs.unlink(filePath);
+    } catch (error) {
+      const err = error as NodeJS.ErrnoException;
+      if (err.code !== "ENOENT") {
+        throw error;
+      }
+    }
+  }
+
+  private sort(items: ConversationSummary[]): ConversationSummary[] {
+    return items.sort((a, b) => {
+      const left = (b.updatedAt ?? b.createdAt)?.getTime() ?? 0;
+      const right = (a.updatedAt ?? a.createdAt)?.getTime() ?? 0;
+      return left - right;
+    });
+  }
+}

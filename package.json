@@ -1,0 +1,92 @@
+{
+  "name": "vscode-codex-chat-manager",
+  "displayName": "Codex Chat Manager",
+  "description": "在 VS Code 中浏览和管理本机 Codex 插件对话（本地使用，不上架）",
+  "version": "0.2.0",
+  "publisher": "local",
+  "private": true,
+  "repository": {
+    "type": "git",
+    "url": "https://github.com/Zero-Kq/vscode-codex-chat-manager.git"
+  },
+  "engines": {
+    "vscode": "^1.85.0"
+  },
+  "categories": [
+    "Other"
+  ],
+  "activationEvents": [
+    "onStartupFinished"
+  ],
+  "main": "./out/extension.js",
+  "contributes": {
+    "viewsContainers": {
+      "activitybar": [
+        {
+          "id": "codexChatManager",
+          "title": "Codex 对话",
+          "icon": "media/icon.svg"
+        }
+      ]
+    },
+    "views": {
+      "codexChatManager": [
+        {
+          "type": "webview",
+          "id": "codexChatManager.sidebar",
+          "name": "聊天"
+        }
+      ]
+    },
+    "commands": [
+      {
+        "command": "codexChatManager.refresh",
+        "title": "刷新对话列表",
+        "icon": "$(refresh)"
+      }
+    ],
+    "menus": {
+      "view/title": [
+        {
+          "command": "codexChatManager.refresh",
+          "when": "view == codexChatManager.sidebar",
+          "group": "navigation"
+        }
+      ]
+    },
+    "configuration": {
+      "title": "Codex Chat Manager",
+      "properties": {
+        "codexChatManager.codexHome": {
+          "type": "string",
+          "default": "",
+          "description": "Codex 主目录。留空则使用 ~/.codex"
+        },
+        "codexChatManager.sessionsDir": {
+          "type": "string",
+          "default": "",
+          "description": "Codex 会话目录。留空则使用 ~/.codex/sessions"
+        },
+        "codexChatManager.indexFile": {
+          "type": "string",
+          "default": "",
+          "description": "Codex 会话索引文件。留空则使用 ~/.codex/session_index.jsonl"
+        }
+      }
+    }
+  },
+  "scripts": {
+    "vscode:prepublish": "npm run compile",
+    "compile": "tsc -p ./",
+    "watch": "tsc -watch -p ./",
+    "lint": "eslint src --ext ts"
+  },
+  "devDependencies": {
+    "@types/node": "^20.17.0",
+    "@types/vscode": "^1.85.0",
+    "@typescript-eslint/eslint-plugin": "^8.18.0",
+    "@typescript-eslint/parser": "^8.18.0",
+    "eslint": "^9.16.0",
+    "typescript": "^5.7.2"
+  }
+}
