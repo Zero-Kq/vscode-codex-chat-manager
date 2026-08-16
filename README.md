@@ -14,15 +14,25 @@
 - 识别进行中的会话
 - 打开对话预览
 
-## 安装（本地 .vsix）
+## 安装
+
+仓库已包含打包好的 `vscode-codex-chat-manager-0.3.0.vsix`，无需编译。
+
+1. 克隆或下载本仓库
+2. 在 VS Code / Cursor 扩展视图中选择 **Install from VSIX...**
+3. 选中仓库根目录下的 `vscode-codex-chat-manager-0.3.0.vsix`
+
+本机需要已使用过 Codex（存在 `~/.codex`），并安装 `sqlite3` 或 `python3`。插件读取的是当前设备上的 Codex 对话，不会同步其他电脑的记录。
+
+## 自行打包
+
+如需从源码重新生成 `.vsix`：
 
 ```bash
 npm install
 npm run compile
 npx @vscode/vsce package --no-dependencies
 ```
-
-在 VS Code / Cursor 扩展视图中选择 **Install from VSIX...**，安装生成的 `vscode-codex-chat-manager-0.3.0.vsix`。
 
 ## 开发
 
