@@ -111,11 +111,124 @@ html, body {
   padding: 0 4px 12px;
 }
 
-.item {
-  display: grid;
-  grid-template-columns: minmax(0, 1fr) auto;
-  gap: 8px;
+.project {
+  margin: 0 0 4px;
+}
+
+.project-header {
+  display: flex;
   align-items: center;
+  gap: 6px;
+  width: 100%;
+  border: none;
+  background: transparent;
+  color: inherit;
+  text-align: left;
+  padding: 6px 8px;
+  border-radius: 6px;
+  cursor: pointer;
+  font: inherit;
+}
+
+.project-header:hover {
+  background: var(--hover);
+}
+
+.chevron {
+  width: 0;
+  height: 0;
+  border-left: 4px solid transparent;
+  border-right: 4px solid transparent;
+  border-top: 5px solid var(--muted);
+  transform: rotate(0deg);
+  transition: transform 0.12s ease;
+}
+
+.project.collapsed .chevron {
+  transform: rotate(-90deg);
+}
+
+.project-name {
+  overflow: hidden;
+  text-overflow: ellipsis;
+  white-space: nowrap;
+  font-weight: 600;
+}
+
+.project-count {
+  margin-left: auto;
+  color: var(--muted);
+  font-size: 11px;
+}
+
+.search-summary {
+  color: var(--muted);
+  font-size: 12px;
+  padding: 4px 10px 8px;
+}
+
+.hit-count {
+  margin-left: auto;
+  min-width: 18px;
+  height: 18px;
+  padding: 0 6px;
+  border-radius: 999px;
+  background: var(--vscode-badge-background, #007acc);
+  color: var(--vscode-badge-foreground, #fff);
+  font-size: 11px;
+  line-height: 18px;
+  text-align: center;
+}
+
+.hit {
+  display: block;
+  width: 100%;
+  border: none;
+  background: transparent;
+  color: inherit;
+  text-align: left;
+  padding: 4px 8px 4px 18px;
+  border-radius: 4px;
+  cursor: pointer;
+  font: inherit;
+}
+
+.hit:hover,
+.hit.current {
+  background: var(--hover);
+}
+
+.hit.current {
+  outline: 1px solid var(--accent);
+}
+
+.hit-text {
+  display: block;
+  overflow: hidden;
+  text-overflow: ellipsis;
+  white-space: nowrap;
+  color: var(--muted);
+}
+
+.hit-text mark {
+  color: var(--fg);
+  background: color-mix(in srgb, var(--accent) 35%, transparent);
+  border-radius: 2px;
+  padding: 0 1px;
+}
+
+.project-items {
+  padding: 0 0 4px 8px;
+}
+
+.project.collapsed .project-items {
+  display: none;
+}
+
+.item {
+  display: flex;
+  align-items: center;
+  gap: 8px;
   width: 100%;
   border: none;
   background: transparent;
@@ -124,13 +237,6 @@ html, body {
   padding: 8px 8px;
   border-radius: 6px;
   cursor: pointer;
-}
-
-.main {
-  min-width: 0;
-  display: flex;
-  align-items: center;
-  gap: 8px;
 }
 
 .item:hover,
@@ -146,6 +252,36 @@ html, body {
   flex: 1;
 }
 
+.badge {
+  flex: none;
+  color: var(--muted);
+  font-size: 11px;
+}
+
+.running {
+  display: inline-flex;
+  align-items: center;
+  gap: 5px;
+  flex: none;
+  color: var(--accent);
+  font-size: 11px;
+}
+
+.running-dot {
+  width: 7px;
+  height: 7px;
+  border-radius: 50%;
+  background: var(--accent);
+  box-shadow: 0 0 0 0 color-mix(in srgb, var(--accent) 70%, transparent);
+  animation: pulse 1.4s ease-out infinite;
+}
+
+@keyframes pulse {
+  0% { box-shadow: 0 0 0 0 color-mix(in srgb, var(--accent) 55%, transparent); }
+  70% { box-shadow: 0 0 0 6px transparent; }
+  100% { box-shadow: 0 0 0 0 transparent; }
+}
+
 .time {
   color: var(--muted);
   font-size: 12px;
@@ -153,45 +289,45 @@ html, body {
   margin-left: auto;
 }
 
-.badge {
-  color: var(--muted);
-  font-size: 11px;
+.menu {
+  position: fixed;
+  z-index: 20;
+  min-width: 132px;
+  padding: 4px;
+  background: var(--vscode-menu-background, var(--vscode-editorWidget-background, #252526));
+  color: var(--vscode-menu-foreground, var(--fg));
+  border: 1px solid var(--vscode-menu-border, var(--vscode-editorWidget-border, #454545));
+  border-radius: 6px;
+  box-shadow: 0 8px 24px rgba(0, 0, 0, 0.35);
 }
 
-.row-actions {
-  display: flex;
-  align-items: center;
-  gap: 2px;
+.menu[hidden] {
+  display: none;
 }
 
-.delete,
-.archive-btn {
-  opacity: 0;
+.menu button {
+  display: block;
+  width: 100%;
   border: none;
   background: transparent;
-  cursor: pointer;
+  color: inherit;
+  text-align: left;
+  padding: 6px 10px;
   border-radius: 4px;
-  width: 22px;
-  height: 22px;
+  cursor: pointer;
+  font: inherit;
 }
 
-.delete {
+.menu button[hidden] {
+  display: none;
+}
+
+.menu button:hover {
+  background: var(--vscode-menu-selectionBackground, var(--hover));
+}
+
+.menu button.danger {
   color: var(--danger);
-}
-
-.archive-btn {
-  color: var(--muted);
-}
-
-.item:hover .delete,
-.item:hover .archive-btn,
-.item:focus-within .delete,
-.item:focus-within .archive-btn {
-  opacity: 1;
-}
-
-.archive-btn:hover {
-  color: var(--fg);
 }
 
 .empty {

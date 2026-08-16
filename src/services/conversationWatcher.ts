@@ -22,6 +22,7 @@ export class ConversationWatcher implements vscode.Disposable {
       this.watch(base, "session_index.jsonl");
       this.watch(base, "state_5.sqlite");
       this.watch(base, "state_5.sqlite-wal");
+      this.watch(base, "thread-writer-locks/**");
     }
 
     this.pollTimer = setInterval(() => {
@@ -83,6 +84,6 @@ export class ConversationWatcher implements vscode.Disposable {
 
 function fingerprint(conversations: ConversationSummary[]): string {
   return conversations
-    .map((item) => `${item.id}|${item.title}|${item.archived ? 1 : 0}|${item.updatedAt?.getTime() ?? 0}`)
+    .map((item) => `${item.id}|${item.title}|${item.archived ? 1 : 0}|${item.running ? 1 : 0}|${item.updatedAt?.getTime() ?? 0}`)
     .join("\n");
 }

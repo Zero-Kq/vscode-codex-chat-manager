@@ -8,7 +8,9 @@ import {
   ConversationDetail,
   ConversationMessage,
   ConversationStore,
-  ConversationSummary
+  ConversationSummary,
+  SearchHit,
+  SearchResult
 } from "./types";
 
 interface SessionIndexEntry {
@@ -121,7 +123,7 @@ function isHiddenSource(source: string): boolean {
   const normalized = source.trim().toLowerCase();
   return (
     normalized === "exec" ||
-    normalized.startsWith("subagent") ||
+    normalized.includes("subagent") ||
     normalized.startsWith("internal")
   );
 }
@@ -138,9 +140,83 @@ function isInternalHistoryPrompt(text: string): boolean {
   );
 }
 
+const INJECTED_CONTEXT_TAGS = [
+  "recommended_plugins",
+  "skills_instructions",
+  "INSTRUCTIONS",
+  "environment_context",
+  "permissions instructions",
+  "collaboration_mode",
+  "apps_instructions",
+  "plugins_instructions"
+];
+
+function stripInjectedContext(text: string): string {
+  let value = text;
+  for (const tag of INJECTED_CONTEXT_TAGS) {
+    const escaped = tag.replace(/[.*+?^${}()|[\]\\]/g, "\\$&");
+    value = value.replace(new RegExp(`<${escaped}\\b[\\s\\S]*?<\\/${escaped}>`, "gi"), "");
+  }
+  value = value.replace(/^# AGENTS\.md instructions for[^\n]*\n*/gm, "");
+  return value.trim();
+}
+
+function isInjectedContext(text: string): boolean {
+  const value = text.trim();
+  if (!value) {
+    return false;
+  }
+  if (isInternalHistoryPrompt(value)) {
+    return true;
+  }
+  return (
+    value.startsWith("<recommended_plugins>") ||
+    value.startsWith("<skills_instructions>") ||
+    value.startsWith("<INSTRUCTIONS>") ||
+    value.startsWith("<environment_context>") ||
+    value.startsWith("<permissions") ||
+    value.startsWith("<collaboration_mode>") ||
+    value.startsWith("<apps_instructions>") ||
+    value.startsWith("<plugins_instructions>") ||
+    value.startsWith("# AGENTS.md instructions")
+  );
+}
+
 function isDisplayableTitle(title: string): boolean {
-  const value = title.trim();
-  return Boolean(value) && !isRolloutName(value) && !isInternalHistoryPrompt(value);
+  const value = stripInjectedContext(title);
+  return Boolean(value) && !isRolloutName(value) && !isInternalHistoryPrompt(value) && !isInjectedContext(value);
+}
+
+function flattenText(text: string): string {
+  return text.replace(/\s+/g, " ").trim();
+}
+
+function makeSnippet(text: string, index: number, length: number, radius = 36): string {
+  const start = Math.max(0, index - radius);
+  const end = Math.min(text.length, index + length + radius);
+  const prefix = start > 0 ? "..." : "";
+  const suffix = end < text.length ? "..." : "";
+  return `${prefix}${flattenText(text.slice(start, end))}${suffix}`;
+}
+
+function collectHits(text: string, needle: string, role: SearchHit["role"], occurrence = -1): SearchHit[] {
+  if (!text.trim()) {
+    return [];
+  }
+  const lower = text.toLowerCase();
+  const hits: SearchHit[] = [];
+  let from = 0;
+  let nextOccurrence = occurrence;
+  while (hits.length < 40) {
+    const index = lower.indexOf(needle, from);
+    if (index === -1) {
+      break;
+    }
+    const current = nextOccurrence < 0 ? -1 : nextOccurrence++;
+    hits.push({ text: makeSnippet(text, index, needle.length), role, occurrence: current });
+    from = index + Math.max(needle.length, 1);
+  }
+  return hits;
 }
 
 function isExplicitTitle(title: string, firstUserMessage?: string): boolean {
@@ -152,6 +228,8 @@ function isExplicitTitle(title: string, firstUserMessage?: string): boolean {
 }
 
 export class CodexSessionStore implements ConversationStore {
+  private readonly contentCache = new Map<string, { mtime: number; messages: ConversationMessage[] }>();
+
   constructor(private readonly getConfig = () => vscode.workspace.getConfiguration("codexChatManager")) {}
 
   private codexHome(): string {
@@ -187,7 +265,50 @@ export class CodexSessionStore implements ConversationStore {
     if (items.length === 0) {
       items = await this.listFromFilesystem(titles);
     }
-    return this.sort(items.filter((item) => this.matchesFilter(item, filter)));
+    const visible = items.filter((item) => this.matchesFilter(item, filter));
+    const withStatus = await Promise.all(
+      visible.map(async (item) => ({
+        ...item,
+        running: await this.isTurnRunning(item.sourcePath)
+      }))
+    );
+    return this.sort(withStatus);
+  }
+
+  async search(query: string): Promise<SearchResult[]> {
+    const needle = query.trim().toLowerCase();
+    if (!needle) {
+      return [];
+    }
+    const results: SearchResult[] = [];
+    for (const item of await this.list("all")) {
+      const hits = collectHits(item.title, needle, "title");
+      if (item.preview && item.preview !== item.title) {
+        hits.push(...collectHits(item.preview, needle, "user"));
+      }
+      let occurrence = 0;
+      for (const message of await this.loadMessages(item)) {
+        if (message.role !== "user" && message.role !== "assistant") {
+          continue;
+        }
+        const messageHits = collectHits(message.content, needle, message.role, occurrence);
+        occurrence += messageHits.length;
+        hits.push(...messageHits);
+      }
+      if (hits.length === 0) {
+        continue;
+      }
+      results.push({
+        id: item.id,
+        title: item.title,
+        archived: item.archived,
+        running: item.running,
+        cwd: item.cwd,
+        project: item.cwd ? path.basename(item.cwd) : "未分类",
+        hits: hits.slice(0, 30)
+      });
+    }
+    return results;
   }
 
   async get(id: string): Promise<ConversationDetail | undefined> {
@@ -240,6 +361,22 @@ export class CodexSessionStore implements ConversationStore {
     }
     const restoredPath = await this.relocateSessionFiles(id, summary.sourcePath, false);
     await this.setSqliteArchived(id, restoredPath, false);
+  }
+
+  async rename(id: string, title: string): Promise<void> {
+    const next = title.trim().split(/\r?\n/, 1)[0].slice(0, 80);
+    if (!next) {
+      throw new Error("标题不能为空。");
+    }
+    if (!isDisplayableTitle(next)) {
+      throw new Error("标题无效。");
+    }
+    const summary = (await this.list("all")).find((item) => item.id === id);
+    if (!summary) {
+      throw new Error("未找到该对话。");
+    }
+    await this.setIndexTitle(id, next);
+    await this.setSqliteTitle(id, next);
   }
 
   async archive(id: string): Promise<void> {
@@ -346,6 +483,45 @@ export class CodexSessionStore implements ConversationStore {
     return true;
   }
 
+  private async isTurnRunning(filePath: string): Promise<boolean> {
+    try {
+      const handle = await fs.open(filePath, "r");
+      try {
+        const { size } = await handle.stat();
+        if (size <= 0) {
+          return false;
+        }
+        const chunk = Math.min(size, 64 * 1024);
+        const buffer = Buffer.alloc(chunk);
+        await handle.read(buffer, 0, chunk, size - chunk);
+        const text = buffer.toString("utf8");
+        const lines = text.split(/\r?\n/).slice(size > chunk ? 1 : 0);
+        let running = false;
+        for (const line of lines) {
+          if (!line.trim()) {
+            continue;
+          }
+          try {
+            const record = JSON.parse(line) as { type?: unknown; payload?: { type?: unknown } };
+            const kind = String(record.payload?.type ?? record.type ?? "");
+            if (kind === "task_started") {
+              running = true;
+            } else if (kind === "task_complete" || kind === "turn_aborted" || kind === "turn_failed" || kind === "error") {
+              running = false;
+            }
+          } catch {
+            // 跳过截断或不完整的行
+          }
+        }
+        return running;
+      } finally {
+        await handle.close();
+      }
+    } catch {
+      return false;
+    }
+  }
+
   private async listFromSqlite(titles: Map<string, string>): Promise<ConversationSummary[]> {
     const dbPath = this.stateDb();
     try {
@@ -416,7 +592,11 @@ export class CodexSessionStore implements ConversationStore {
     if (asString(row?.agent_nickname).trim() || asString(row?.agent_role).trim()) {
       return false;
     }
-    if (isHiddenSource(summary.source || asString(row?.source)) || isHiddenSource(asString(row?.thread_source))) {
+    const threadSource = asString(row?.thread_source).trim().toLowerCase();
+    if (threadSource && threadSource !== "user") {
+      return false;
+    }
+    if (isHiddenSource(summary.source || asString(row?.source)) || isHiddenSource(threadSource)) {
       return false;
     }
     if (isInternalHistoryPrompt(summary.title) || isInternalHistoryPrompt(summary.preview ?? "")) {
@@ -531,6 +711,21 @@ export class CodexSessionStore implements ConversationStore {
     return results;
   }
 
+  private async loadMessages(item: ConversationSummary): Promise<ConversationMessage[]> {
+    try {
+      const stat = await fs.stat(item.sourcePath);
+      const cached = this.contentCache.get(item.sourcePath);
+      if (cached && cached.mtime === stat.mtimeMs) {
+        return cached.messages;
+      }
+      const messages = await this.readMessages(item.sourcePath);
+      this.contentCache.set(item.sourcePath, { mtime: stat.mtimeMs, messages });
+      return messages;
+    } catch {
+      return [];
+    }
+  }
+
   private async readMessages(filePath: string): Promise<ConversationMessage[]> {
     let raw: string;
     try {
@@ -572,8 +767,11 @@ export class CodexSessionStore implements ConversationStore {
     }
 
     const role = this.extractRole(record);
-    const content = this.extractContent(record);
-    if (!content) {
+    if (role !== "user" && role !== "assistant") {
+      return undefined;
+    }
+    const content = stripInjectedContext(this.extractContent(record));
+    if (!content || isInjectedContext(content) || isInternalHistoryPrompt(content)) {
       return undefined;
     }
 
@@ -587,7 +785,10 @@ export class CodexSessionStore implements ConversationStore {
   private extractRole(record: Record<string, unknown>): ConversationMessage["role"] {
     const payload = (record.payload ?? record.message ?? record) as Record<string, unknown>;
     const role = String(payload.role ?? record.role ?? "").toLowerCase();
-    if (role === "user" || role === "assistant" || role === "system" || role === "tool") {
+    if (role === "developer" || role === "system" || role === "tool") {
+      return "system";
+    }
+    if (role === "user" || role === "assistant") {
       return role;
     }
     const type = String(payload.type ?? record.type ?? "").toLowerCase();
@@ -621,6 +822,69 @@ export class CodexSessionStore implements ConversationStore {
         .trim();
     }
     return "";
+  }
+
+  private async setIndexTitle(id: string, title: string): Promise<void> {
+    const indexPath = this.indexFile();
+    let raw = "";
+    try {
+      raw = await fs.readFile(indexPath, "utf8");
+    } catch {
+      raw = "";
+    }
+
+    let found = false;
+    const lines = raw.split(/\r?\n/).filter((line) => line.trim());
+    const next = lines.map((line) => {
+      try {
+        const entry = JSON.parse(line) as SessionIndexEntry;
+        if (entry.id !== id) {
+          return line;
+        }
+        found = true;
+        return JSON.stringify({
+          ...entry,
+          thread_name: title,
+          title,
+          updated_at: new Date().toISOString()
+        });
+      } catch {
+        return line;
+      }
+    });
+    if (!found) {
+      next.push(
+        JSON.stringify({
+          id,
+          thread_name: title,
+          title,
+          updated_at: new Date().toISOString()
+        })
+      );
+    }
+    await fs.mkdir(path.dirname(indexPath), { recursive: true });
+    await fs.writeFile(indexPath, next.length ? `${next.join("\n")}\n` : "");
+  }
+
+  private async setSqliteTitle(id: string, title: string): Promise<void> {
+    const dbPath = this.stateDb();
+    try {
+      await fs.access(dbPath);
+    } catch {
+      return;
+    }
+
+    const quotedId = sqlString(id);
+    const quotedTitle = sqlString(title);
+    try {
+      await querySqlite(
+        dbPath,
+        `UPDATE threads SET title = ${quotedTitle}, name = ${quotedTitle} WHERE id = ${quotedId}`,
+        false
+      );
+    } catch {
+      await querySqlite(dbPath, `UPDATE threads SET title = ${quotedTitle} WHERE id = ${quotedId}`, false);
+    }
   }
 
   private async removeIndexEntries(id: string): Promise<void> {
@@ -711,6 +975,9 @@ export class CodexSessionStore implements ConversationStore {
 
   private sort(items: ConversationSummary[]): ConversationSummary[] {
     return items.sort((a, b) => {
+      if (Boolean(a.running) !== Boolean(b.running)) {
+        return a.running ? -1 : 1;
+      }
       const left = (b.updatedAt ?? b.createdAt)?.getTime() ?? 0;
       const right = (a.updatedAt ?? a.createdAt)?.getTime() ?? 0;
       return left - right;

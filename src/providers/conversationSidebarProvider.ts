@@ -1,3 +1,4 @@
+import * as path from "path";
 import * as vscode from "vscode";
 import { ConversationStore, ConversationSummary } from "../stores/types";
 import { ConversationDetailProvider } from "./conversationWebviewProvider";
@@ -7,7 +8,10 @@ interface SidebarConversation {
   title: string;
   preview?: string;
   archived: boolean;
+  running?: boolean;
   updatedAt?: string;
+  cwd?: string;
+  project: string;
 }
 
 export class ConversationSidebarProvider implements vscode.WebviewViewProvider {
@@ -28,15 +32,26 @@ export class ConversationSidebarProvider implements vscode.WebviewViewProvider {
     };
     webviewView.webview.html = this.renderHtml(webviewView.webview);
 
-    webviewView.webview.onDidReceiveMessage(async (message: { type?: string; id?: string }) => {
+    webviewView.webview.onDidReceiveMessage(async (message: { type?: string; id?: string; query?: string; occurrence?: number }) => {
       switch (message.type) {
         case "ready":
         case "refresh":
           await this.refresh();
           break;
+        case "search":
+          await this.searchContent(message.query ?? "");
+          break;
         case "open":
           if (message.id) {
-            await this.detail.open(message.id);
+            await this.detail.open(message.id, {
+              query: message.query,
+              occurrence: message.occurrence
+            });
+          }
+          break;
+        case "rename":
+          if (message.id) {
+            await this.renameConversation(message.id);
           }
           break;
         case "delete":
@@ -73,6 +88,18 @@ export class ConversationSidebarProvider implements vscode.WebviewViewProvider {
     });
   }
 
+  private async searchContent(query: string): Promise<void> {
+    if (!this.view) {
+      return;
+    }
+    const results = await this.store.search(query);
+    await this.view.webview.postMessage({
+      type: "searchResults",
+      query,
+      results
+    });
+  }
+
   private async archiveConversation(id: string): Promise<void> {
     try {
       await this.store.archive(id);
@@ -95,6 +122,31 @@ export class ConversationSidebarProvider implements vscode.WebviewViewProvider {
     }
   }
 
+  private async renameConversation(id: string): Promise<void> {
+    const current = (await this.store.list("all")).find((item) => item.id === id);
+    if (!current) {
+      void vscode.window.showWarningMessage("未找到该对话。");
+      return;
+    }
+    const title = await vscode.window.showInputBox({
+      title: "重命名对话",
+      prompt: "输入新的对话标题",
+      value: current.title,
+      valueSelection: [0, current.title.length],
+      validateInput: (value) => (value.trim() ? undefined : "标题不能为空")
+    });
+    if (title == null) {
+      return;
+    }
+    try {
+      await this.store.rename(id, title);
+      await this.refresh();
+    } catch (error) {
+      const text = error instanceof Error ? error.message : String(error);
+      void vscode.window.showErrorMessage(`重命名失败：${text}`);
+    }
+  }
+
   private async deleteConversation(id: string): Promise<void> {
     try {
       await this.store.delete(id);
@@ -109,12 +161,16 @@ export class ConversationSidebarProvider implements vscode.WebviewViewProvider {
   }
 
   private toViewModel(item: ConversationSummary): SidebarConversation {
+    const cwd = item.cwd?.trim() || "";
     return {
       id: item.id,
       title: item.title,
       preview: item.preview,
       archived: item.archived,
-      updatedAt: item.updatedAt?.toISOString()
+      running: item.running,
+      updatedAt: item.updatedAt?.toISOString(),
+      cwd: cwd || undefined,
+      project: cwd ? path.basename(cwd) : "未分类"
     };
   }
 
@@ -141,7 +197,7 @@ export class ConversationSidebarProvider implements vscode.WebviewViewProvider {
                 <circle cx="11" cy="11" r="7" stroke="currentColor" stroke-width="2"/>
                 <path d="M20 20l-3.5-3.5" stroke="currentColor" stroke-width="2" stroke-linecap="round"/>
               </svg>
-              <input id="search" type="search" placeholder="搜索最近聊天" />
+              <input id="search" type="search" placeholder="搜索标题或对话内容" />
             </label>
             <div class="filters">
               <button class="filter" data-filter="all">全部对话</button>
@@ -149,6 +205,12 @@ export class ConversationSidebarProvider implements vscode.WebviewViewProvider {
               <button class="filter" data-filter="archived">已归档</button>
             </div>
             <div class="list" id="list"></div>
+          </div>
+          <div class="menu" id="menu" hidden>
+            <button type="button" data-menu="rename">重命名</button>
+            <button type="button" data-menu="archive">归档</button>
+            <button type="button" data-menu="unarchive">取消归档</button>
+            <button type="button" data-menu="delete" class="danger">删除</button>
           </div>
           <div class="modal" id="modal">
             <div class="dialog">

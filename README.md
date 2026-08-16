@@ -7,11 +7,12 @@
 ## 功能
 
 - 显示 Codex 同款会话标题（不再用 `rollout-...` 文件名）
-- 识别已归档对话（`threads.archived` / `archived_sessions`）
+- 按项目分组，右键菜单重命名 / 归档 / 删除
 - 筛选：全部对话、未归档、已归档
+- 只列出用户对话（不展示子代理等内部会话）
+- 搜索标题和对话内容，命中片段可跳转高亮
+- 识别进行中的会话
 - 打开对话预览
-- 归档 / 取消归档
-- 删除对话（先弹出确认框）
 
 ## 安装（本地 .vsix）
 
@@ -21,7 +22,7 @@ npm run compile
 npx @vscode/vsce package --no-dependencies
 ```
 
-在 VS Code / Cursor 扩展视图中选择 **Install from VSIX...**，安装生成的 `vscode-codex-chat-manager-0.2.0.vsix`。
+在 VS Code / Cursor 扩展视图中选择 **Install from VSIX...**，安装生成的 `vscode-codex-chat-manager-0.3.0.vsix`。
 
 ## 开发
 
