@@ -12,15 +12,15 @@
 - 只列出用户对话（不展示子代理等内部会话）
 - 搜索标题和对话内容，命中片段可跳转高亮
 - 识别进行中的会话
-- 打开对话预览
+- 打开对话预览，使用接近 Codex 的 Markdown 排版（标题、列表、引用、表格、代码块与复制按钮）
 
 ## 安装
 
-仓库已包含打包好的 `vscode-codex-chat-manager-0.3.0.vsix`，无需编译。
+仓库已包含打包好的 `vscode-codex-chat-manager-0.3.1.vsix`，无需编译。
 
 1. 克隆或下载本仓库
 2. 在 VS Code / Cursor 扩展视图中选择 **Install from VSIX...**
-3. 选中仓库根目录下的 `vscode-codex-chat-manager-0.3.0.vsix`
+3. 选中仓库根目录下的 `vscode-codex-chat-manager-0.3.1.vsix`
 
 本机需要已使用过 Codex（存在 `~/.codex`），并安装 `sqlite3` 或 `python3`。插件读取的是当前设备上的 Codex 对话，不会同步其他电脑的记录。
 

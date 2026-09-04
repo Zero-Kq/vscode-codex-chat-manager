@@ -2,7 +2,7 @@
   "name": "vscode-codex-chat-manager",
   "displayName": "Codex Chat Manager",
   "description": "在 VS Code 中浏览和管理本机 Codex 插件对话（本地使用，不上架）",
-  "version": "0.3.0",
+  "version": "0.3.1",
   "publisher": "local",
   "private": true,
   "repository": {
