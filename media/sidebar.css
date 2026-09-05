@@ -167,6 +167,46 @@ html, body {
   padding: 4px 10px 8px;
 }
 
+.search-progress {
+  padding: 12px 10px;
+  color: var(--muted);
+  font-size: 12px;
+}
+
+.search-progress-label {
+  display: flex;
+  justify-content: space-between;
+  gap: 12px;
+  margin-bottom: 8px;
+}
+
+.search-progress-label span:last-child {
+  overflow: hidden;
+  text-overflow: ellipsis;
+  white-space: nowrap;
+  text-align: right;
+}
+
+.search-progress-track {
+  height: 3px;
+  overflow: hidden;
+  border-radius: 999px;
+  background: color-mix(in srgb, var(--fg) 12%, transparent);
+}
+
+.search-progress-track span {
+  display: block;
+  height: 100%;
+  min-width: 8px;
+  border-radius: inherit;
+  background: var(--accent);
+  transition: width 0.12s ease;
+}
+
+.search-error {
+  color: var(--danger);
+}
+
 .hit-count {
   margin-left: auto;
   min-width: 18px;
@@ -181,7 +221,10 @@ html, body {
 }
 
 .hit {
-  display: block;
+  display: grid;
+  grid-template-columns: 34px minmax(0, 1fr);
+  align-items: center;
+  gap: 6px;
   width: 100%;
   border: none;
   background: transparent;
@@ -200,6 +243,12 @@ html, body {
 
 .hit.current {
   outline: 1px solid var(--accent);
+}
+
+.hit-role {
+  color: var(--muted);
+  font-size: 10px;
+  opacity: 0.8;
 }
 
 .hit-text {

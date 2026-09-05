@@ -9,7 +9,13 @@ const state = {
   pendingDeleteId: null,
   collapsed: {},
   searchTimer: null,
-  activeHit: null
+  activeHit: null,
+  searchRequestId: 0,
+  activeSearchRequestId: 0,
+  searchStatus: null,
+  searchError: "",
+  searchTerms: [],
+  searchFilters: {}
 };
 
 const listEl = document.getElementById("list");
@@ -64,6 +70,9 @@ function visibleConversations() {
 }
 
 function visibleSearchResults() {
+  if (typeof state.searchFilters.archived === "boolean") {
+    return state.searchResults;
+  }
   return state.searchResults.filter(matchesFilter);
 }
 
@@ -108,27 +117,44 @@ function escapeRegExp(text) {
   return text.replace(/[.*+?^${}()|[\]\\]/g, "\\$&");
 }
 
-function highlight(text, query) {
-  const escaped = escapeHtml(text);
-  const needle = escapeHtml(query);
-  if (!needle) {
-    return escaped;
+function highlightMany(text, terms) {
+  const values = (terms || []).filter(Boolean).sort((left, right) => right.length - left.length);
+  if (values.length === 0) {
+    return escapeHtml(text);
   }
-  return escaped.replace(new RegExp(escapeRegExp(needle), "gi"), (match) => `<mark>${match}</mark>`);
+  const pattern = values.map((term) => escapeRegExp(escapeHtml(term))).join("|");
+  return escapeHtml(text).replace(new RegExp(pattern, "gi"), (match) => `<mark>${match}</mark>`);
 }
 
 function renderHit(result, hit) {
-  const current = state.activeHit && state.activeHit.id === result.id && state.activeHit.occurrence === hit.occurrence ? " current" : "";
+  const current = state.activeHit && state.activeHit.id === result.id && state.activeHit.occurrence === hit.occurrence && state.activeHit.query === hit.query ? " current" : "";
   return `
-    <button class="hit${current}" data-open="${result.id}" data-occurrence="${hit.occurrence}" title="${escapeAttr(hit.text)}">
-      <span class="hit-text">${highlight(hit.text, state.query.trim())}</span>
+    <button class="hit${current}" data-open="${result.id}" data-occurrence="${hit.occurrence}" data-query="${escapeAttr(hit.query || "")}" title="${escapeAttr(hit.text)}">
+      <span class="hit-role">${hit.role === "user" ? "用户" : hit.role === "assistant" ? "助手" : "标题"}</span>
+      <span class="hit-text">${highlightMany(hit.text, hit.query ? [hit.query] : state.searchTerms)}</span>
     </button>`;
 }
 
 function renderSearch() {
   const query = state.query.trim();
+  if (state.searchError) {
+    listEl.innerHTML = `<div class="empty search-error">搜索失败：${escapeHtml(state.searchError)}</div>`;
+    return;
+  }
   if (state.searchQuery !== query) {
-    listEl.innerHTML = `<div class="empty">正在搜索…</div>`;
+    const progress = state.searchStatus;
+    const total = progress?.total || 0;
+    const completed = progress?.completed || 0;
+    const percent = total > 0 ? Math.min(100, Math.round((completed / total) * 100)) : 0;
+    const phase = progress?.phase === "searching" ? "正在搜索索引" : progress ? "正在更新索引" : "等待输入停止";
+    const detail = progress
+      ? `${completed}/${total} · 新建 ${progress.indexed || 0} · 缓存 ${progress.reused || 0}`
+      : "250ms 后开始搜索";
+    listEl.innerHTML = `
+      <div class="search-progress" role="status">
+        <div class="search-progress-label"><span>${phase}</span><span>${escapeHtml(detail)}</span></div>
+        <div class="search-progress-track"><span style="width:${percent}%"></span></div>
+      </div>`;
     return;
   }
 
@@ -148,7 +174,7 @@ function renderSearch() {
         <section class="project search-group${collapsed ? " collapsed" : ""}" data-project="${escapeAttr(key)}">
           <button class="project-header" data-toggle-project="${escapeAttr(key)}" data-id="${result.id}" aria-expanded="${!collapsed}">
             <span class="chevron" aria-hidden="true"></span>
-            <span class="project-name" title="${escapeAttr(result.title)}">${highlight(result.title, query)}</span>
+            <span class="project-name" title="${escapeAttr(result.title)}">${highlightMany(result.title, state.searchTerms)}</span>
             ${result.running ? `<span class="running"><span class="running-dot"></span></span>` : ""}
             <span class="hit-count">${result.hits.length}</span>
           </button>
@@ -268,18 +294,31 @@ function closeDeleteModal() {
 function requestContentSearch() {
   if (state.searchTimer) {
     clearTimeout(state.searchTimer);
+    state.searchTimer = null;
   }
+  vscode.postMessage({ type: "cancelSearch" });
   const query = state.query.trim();
+  state.searchQuery = "";
+  state.searchStatus = null;
+  state.searchError = "";
   if (!query) {
     state.searchResults = [];
-    state.searchQuery = "";
+    state.searchTerms = [];
+    state.searchFilters = {};
     state.activeHit = null;
     render();
     return;
   }
+  render();
   state.searchTimer = setTimeout(() => {
-    vscode.postMessage({ type: "search", query });
-  }, 280);
+    state.searchTimer = null;
+    const requestId = state.searchRequestId + 1;
+    state.searchRequestId = requestId;
+    state.activeSearchRequestId = requestId;
+    state.searchStatus = { phase: "indexing", completed: 0, total: 0, indexed: 0, reused: 0 };
+    render();
+    vscode.postMessage({ type: "search", query, requestId });
+  }, 250);
 }
 
 window.addEventListener("message", (event) => {
@@ -287,14 +326,32 @@ window.addEventListener("message", (event) => {
   if (message?.type === "conversations") {
     state.conversations = message.conversations || [];
     render();
-    if (state.query.trim()) {
+    if (state.query.trim() && !state.searchStatus && !state.searchTimer) {
       requestContentSearch();
     }
     return;
   }
-  if (message?.type === "searchResults" && message.query === state.query.trim()) {
+  if (message?.requestId !== state.activeSearchRequestId || message.query !== state.query.trim()) {
+    return;
+  }
+  if (message?.type === "searchProgress") {
+    state.searchStatus = message.progress || null;
+    render();
+    return;
+  }
+  if (message?.type === "searchResults") {
     state.searchQuery = message.query;
     state.searchResults = message.results || [];
+    state.searchTerms = message.terms || [];
+    state.searchFilters = message.filters || {};
+    state.searchStatus = null;
+    state.searchError = "";
+    render();
+    return;
+  }
+  if (message?.type === "searchError") {
+    state.searchError = message.error || "未知错误";
+    state.searchStatus = null;
     render();
   }
 });
@@ -325,12 +382,13 @@ listEl.addEventListener("click", (event) => {
   const hit = event.target.closest("[data-open]");
   if (hit) {
     const occurrence = Number(hit.dataset.occurrence);
-    state.activeHit = { id: hit.dataset.open, occurrence };
+    const matchedQuery = hit.dataset.query || "";
+    state.activeHit = { id: hit.dataset.open, occurrence, query: matchedQuery };
     render();
     vscode.postMessage({
       type: "open",
       id: hit.dataset.open,
-      query: state.query.trim(),
+      query: matchedQuery,
       occurrence: Number.isFinite(occurrence) ? occurrence : -1
     });
     return;

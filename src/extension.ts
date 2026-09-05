@@ -5,7 +5,7 @@ import { ConversationWatcher } from "./services/conversationWatcher";
 import { CodexSessionStore } from "./stores/codexSessionStore";
 
 export function activate(context: vscode.ExtensionContext): void {
-  const store = new CodexSessionStore();
+  const store = new CodexSessionStore(undefined, context.globalStorageUri.fsPath);
   const detail = new ConversationDetailProvider(store);
   const sidebar = new ConversationSidebarProvider(store, context.extensionUri, detail);
   const watcher = new ConversationWatcher(store, () => sidebar.refresh());

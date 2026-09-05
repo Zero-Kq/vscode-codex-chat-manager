@@ -1,5 +1,7 @@
 import * as path from "path";
 import * as vscode from "vscode";
+import { parseSearchQuery } from "../search/searchQuery";
+import { isAbortError } from "../search/sessionSearchIndex";
 import { ConversationStore, ConversationSummary } from "../stores/types";
 import { ConversationDetailProvider } from "./conversationWebviewProvider";
 
@@ -17,6 +19,7 @@ interface SidebarConversation {
 export class ConversationSidebarProvider implements vscode.WebviewViewProvider {
   public static readonly viewType = "codexChatManager.sidebar";
   private view?: vscode.WebviewView;
+  private activeSearch?: AbortController;
 
   constructor(
     private readonly store: ConversationStore,
@@ -32,14 +35,18 @@ export class ConversationSidebarProvider implements vscode.WebviewViewProvider {
     };
     webviewView.webview.html = this.renderHtml(webviewView.webview);
 
-    webviewView.webview.onDidReceiveMessage(async (message: { type?: string; id?: string; query?: string; occurrence?: number }) => {
+    webviewView.webview.onDidReceiveMessage(async (message: { type?: string; id?: string; query?: string; occurrence?: number; requestId?: number }) => {
       switch (message.type) {
         case "ready":
         case "refresh":
           await this.refresh();
           break;
         case "search":
-          await this.searchContent(message.query ?? "");
+          await this.searchContent(message.query ?? "", message.requestId ?? 0);
+          break;
+        case "cancelSearch":
+          this.activeSearch?.abort();
+          this.activeSearch = undefined;
           break;
         case "open":
           if (message.id) {
@@ -88,16 +95,64 @@ export class ConversationSidebarProvider implements vscode.WebviewViewProvider {
     });
   }
 
-  private async searchContent(query: string): Promise<void> {
+  private async searchContent(query: string, requestId: number): Promise<void> {
     if (!this.view) {
       return;
     }
-    const results = await this.store.search(query);
-    await this.view.webview.postMessage({
-      type: "searchResults",
-      query,
-      results
-    });
+    this.activeSearch?.abort();
+    const controller = new AbortController();
+    this.activeSearch = controller;
+    const parsed = parseSearchQuery(query);
+    let lastProgressAt = 0;
+
+    try {
+      const results = await this.store.search(query, {
+        signal: controller.signal,
+        onProgress: (progress) => {
+          if (this.activeSearch !== controller || controller.signal.aborted) {
+            return;
+          }
+          const now = Date.now();
+          const complete = progress.completed >= progress.total;
+          if (!complete && now - lastProgressAt < 80) {
+            return;
+          }
+          lastProgressAt = now;
+          void this.view?.webview.postMessage({
+            type: "searchProgress",
+            query,
+            requestId,
+            progress
+          });
+        }
+      });
+      if (this.activeSearch !== controller || controller.signal.aborted) {
+        return;
+      }
+      await this.view.webview.postMessage({
+        type: "searchResults",
+        query,
+        requestId,
+        terms: parsed.terms,
+        filters: { archived: parsed.archived },
+        results
+      });
+    } catch (error) {
+      if (isAbortError(error) || controller.signal.aborted || this.activeSearch !== controller) {
+        return;
+      }
+      const text = error instanceof Error ? error.message : String(error);
+      await this.view.webview.postMessage({
+        type: "searchError",
+        query,
+        requestId,
+        error: text
+      });
+    } finally {
+      if (this.activeSearch === controller) {
+        this.activeSearch = undefined;
+      }
+    }
   }
 
   private async archiveConversation(id: string): Promise<void> {
@@ -197,7 +252,7 @@ export class ConversationSidebarProvider implements vscode.WebviewViewProvider {
                 <circle cx="11" cy="11" r="7" stroke="currentColor" stroke-width="2"/>
                 <path d="M20 20l-3.5-3.5" stroke="currentColor" stroke-width="2" stroke-linecap="round"/>
               </svg>
-              <input id="search" type="search" placeholder="搜索标题或对话内容" />
+              <input id="search" type="search" placeholder="搜索标题或对话内容" title="支持 project:、role:、is:archived、after:YYYY-MM-DD" />
             </label>
             <div class="filters">
               <button class="filter" data-filter="all">全部对话</button>

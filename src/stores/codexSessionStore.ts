@@ -2,6 +2,8 @@ import * as fs from "fs/promises";
 import * as os from "os";
 import * as path from "path";
 import * as vscode from "vscode";
+import { matchesSearchMetadata, parseSearchQuery } from "../search/searchQuery";
+import { isAbortError, SessionSearchIndex } from "../search/sessionSearchIndex";
 import { querySqlite, sqlString } from "./sqlite";
 import {
   ArchiveFilter,
@@ -10,6 +12,7 @@ import {
   ConversationStore,
   ConversationSummary,
   SearchHit,
+  SearchOptions,
   SearchResult
 } from "./types";
 
@@ -199,10 +202,11 @@ function makeSnippet(text: string, index: number, length: number, radius = 36): 
   return `${prefix}${flattenText(text.slice(start, end))}${suffix}`;
 }
 
-function collectHits(text: string, needle: string, role: SearchHit["role"], occurrence = -1): SearchHit[] {
-  if (!text.trim()) {
+function collectHits(text: string, query: string, role: SearchHit["role"], occurrence = -1): SearchHit[] {
+  if (!text.trim() || !query) {
     return [];
   }
+  const needle = query.toLowerCase();
   const lower = text.toLowerCase();
   const hits: SearchHit[] = [];
   let from = 0;
@@ -213,8 +217,8 @@ function collectHits(text: string, needle: string, role: SearchHit["role"], occu
       break;
     }
     const current = nextOccurrence < 0 ? -1 : nextOccurrence++;
-    hits.push({ text: makeSnippet(text, index, needle.length), role, occurrence: current });
-    from = index + Math.max(needle.length, 1);
+    hits.push({ text: makeSnippet(text, index, query.length), role, occurrence: current, query });
+    from = index + Math.max(query.length, 1);
   }
   return hits;
 }
@@ -227,10 +231,34 @@ function isExplicitTitle(title: string, firstUserMessage?: string): boolean {
   return !(firstMessage && title.trim() === firstMessage);
 }
 
-export class CodexSessionStore implements ConversationStore {
-  private readonly contentCache = new Map<string, { mtime: number; messages: ConversationMessage[] }>();
+async function mapWithConcurrency<T, U>(
+  items: T[],
+  concurrency: number,
+  mapper: (item: T) => Promise<U>
+): Promise<U[]> {
+  const results = new Array<U>(items.length);
+  let nextIndex = 0;
+  const workers = Array.from({ length: Math.min(concurrency, items.length) }, async () => {
+    while (nextIndex < items.length) {
+      const index = nextIndex;
+      nextIndex += 1;
+      results[index] = await mapper(items[index]);
+    }
+  });
+  await Promise.all(workers);
+  return results;
+}
 
-  constructor(private readonly getConfig = () => vscode.workspace.getConfiguration("codexChatManager")) {}
+export class CodexSessionStore implements ConversationStore {
+  private readonly searchIndex: SessionSearchIndex;
+  private readonly runningCache = new Map<string, { size: number; mtimeMs: number; running: boolean }>();
+
+  constructor(
+    private readonly getConfig = () => vscode.workspace.getConfiguration("codexChatManager"),
+    cacheRoot?: string
+  ) {
+    this.searchIndex = new SessionSearchIndex(cacheRoot ? path.join(cacheRoot, "search-index-v1") : undefined);
+  }
 
   private codexHome(): string {
     const configured = this.getConfig().get<string>("codexHome")?.trim();
@@ -266,49 +294,111 @@ export class CodexSessionStore implements ConversationStore {
       items = await this.listFromFilesystem(titles);
     }
     const visible = items.filter((item) => this.matchesFilter(item, filter));
-    const withStatus = await Promise.all(
-      visible.map(async (item) => ({
-        ...item,
-        running: await this.isTurnRunning(item.sourcePath)
-      }))
-    );
+    const withStatus = await mapWithConcurrency(visible, 24, async (item) => ({
+      ...item,
+      running: await this.isTurnRunning(item.sourcePath)
+    }));
     return this.sort(withStatus);
   }
 
-  async search(query: string): Promise<SearchResult[]> {
-    const needle = query.trim().toLowerCase();
-    if (!needle) {
+  async search(query: string, options: SearchOptions = {}): Promise<SearchResult[]> {
+    const parsed = parseSearchQuery(query);
+    if (parsed.errors.length > 0) {
+      throw new Error(parsed.errors.join("；"));
+    }
+    if (parsed.terms.length === 0 && parsed.projects.length === 0 && parsed.roles.length === 0 && parsed.archived === undefined && !parsed.after) {
       return [];
     }
+
+    const allItems = await this.list("all");
+    const candidates = allItems.filter((item) =>
+      matchesSearchMetadata(parsed, {
+        ...item,
+        project: item.cwd ? path.basename(item.cwd) : "未分类"
+      })
+    );
+    let indexed = 0;
+    let reused = 0;
+    const indexedItems = await this.searchIndex.sync(candidates, (record) => this.normalizeMessage(record), {
+      signal: options.signal,
+      onProgress: (progress) => {
+        indexed = progress.indexed;
+        reused = progress.reused;
+        options.onProgress?.(progress);
+      },
+      prune: candidates.length === allItems.length
+    });
+
     const results: SearchResult[] = [];
-    for (const item of await this.list("all")) {
-      const hits = collectHits(item.title, needle, "title");
-      if (item.preview && item.preview !== item.title) {
-        hits.push(...collectHits(item.preview, needle, "user"));
+    for (let itemIndex = 0; itemIndex < indexedItems.length; itemIndex += 1) {
+      if (options.signal?.aborted) {
+        const error = new Error("Search cancelled");
+        error.name = "AbortError";
+        throw error;
       }
-      let occurrence = 0;
-      for (const message of await this.loadMessages(item)) {
-        if (message.role !== "user" && message.role !== "assistant") {
-          continue;
-        }
-        const messageHits = collectHits(message.content, needle, message.role, occurrence);
-        occurrence += messageHits.length;
-        hits.push(...messageHits);
+      const entry = indexedItems[itemIndex];
+      const item = entry.summary;
+      const hits = this.searchIndexedConversation(item, entry.messages, parsed.terms, parsed.roles);
+      const hasSelectedRole = parsed.roles.length === 0 || entry.messages.some(
+        (message) => (message.role === "user" || message.role === "assistant") && parsed.roles.includes(message.role)
+      );
+      if (hasSelectedRole && (parsed.terms.length === 0 || parsed.terms.every((term) => hits.some((hit) => hit.query.toLowerCase() === term.toLowerCase())))) {
+        results.push({
+          id: item.id,
+          title: item.title,
+          archived: item.archived,
+          running: item.running,
+          cwd: item.cwd,
+          project: item.cwd ? path.basename(item.cwd) : "未分类",
+          hits: hits.length > 0 ? hits.slice(0, 30) : [{ text: item.title, role: "title", occurrence: -1, query: "" }]
+        });
       }
-      if (hits.length === 0) {
-        continue;
-      }
-      results.push({
-        id: item.id,
-        title: item.title,
-        archived: item.archived,
-        running: item.running,
-        cwd: item.cwd,
-        project: item.cwd ? path.basename(item.cwd) : "未分类",
-        hits: hits.slice(0, 30)
+      options.onProgress?.({
+        phase: "searching",
+        completed: itemIndex + 1,
+        total: indexedItems.length,
+        indexed,
+        reused,
+        current: item.title
       });
     }
     return results;
+  }
+
+  private searchIndexedConversation(
+    item: ConversationSummary,
+    messages: ConversationMessage[],
+    terms: string[],
+    roles: Array<"user" | "assistant">
+  ): SearchHit[] {
+    const hits: SearchHit[] = [];
+    const restrictRole = roles.length > 0;
+
+    for (const term of terms) {
+      const titleHits = collectHits(item.title, term, "title");
+      if (!restrictRole) {
+        hits.push(...titleHits);
+      }
+
+      let occurrence = 0;
+      let allowedMatches = restrictRole ? 0 : titleHits.length;
+      for (const message of messages) {
+        if (message.role !== "user" && message.role !== "assistant") {
+          continue;
+        }
+        const messageHits = collectHits(message.content, term, message.role, occurrence);
+        occurrence += messageHits.length;
+        if (!restrictRole || roles.includes(message.role)) {
+          hits.push(...messageHits);
+          allowedMatches += messageHits.length;
+        }
+      }
+
+      if (allowedMatches === 0 && (!restrictRole || roles.includes("user")) && item.preview) {
+        hits.push(...collectHits(item.preview, term, "user"));
+      }
+    }
+    return hits;
   }
 
   async get(id: string): Promise<ConversationDetail | undefined> {
@@ -319,7 +409,7 @@ export class CodexSessionStore implements ConversationStore {
     }
     return {
       summary,
-      messages: await this.readMessages(summary.sourcePath)
+      messages: await this.loadMessages(summary)
     };
   }
 
@@ -348,6 +438,7 @@ export class CodexSessionStore implements ConversationStore {
     for (const threadId of ids) {
       await this.removeIndexEntries(threadId);
       await this.deleteSqliteThread(threadId);
+      this.searchIndex.invalidate(threadId);
     }
   }
 
@@ -361,6 +452,7 @@ export class CodexSessionStore implements ConversationStore {
     }
     const restoredPath = await this.relocateSessionFiles(id, summary.sourcePath, false);
     await this.setSqliteArchived(id, restoredPath, false);
+    this.searchIndex.invalidate(id);
   }
 
   async rename(id: string, title: string): Promise<void> {
@@ -389,6 +481,7 @@ export class CodexSessionStore implements ConversationStore {
     }
     const archivedPath = await this.relocateSessionFiles(id, summary.sourcePath, true);
     await this.setSqliteArchived(id, archivedPath, true);
+    this.searchIndex.invalidate(id);
   }
 
   private async relocateSessionFiles(id: string, sourcePath: string, archived: boolean): Promise<string> {
@@ -485,17 +578,23 @@ export class CodexSessionStore implements ConversationStore {
 
   private async isTurnRunning(filePath: string): Promise<boolean> {
     try {
+      const stat = await fs.stat(filePath);
+      const cached = this.runningCache.get(filePath);
+      if (cached && cached.size === stat.size && cached.mtimeMs === stat.mtimeMs) {
+        return cached.running;
+      }
+      if (stat.size <= 0) {
+        this.runningCache.set(filePath, { size: stat.size, mtimeMs: stat.mtimeMs, running: false });
+        return false;
+      }
+
       const handle = await fs.open(filePath, "r");
       try {
-        const { size } = await handle.stat();
-        if (size <= 0) {
-          return false;
-        }
-        const chunk = Math.min(size, 64 * 1024);
+        const chunk = Math.min(stat.size, 64 * 1024);
         const buffer = Buffer.alloc(chunk);
-        await handle.read(buffer, 0, chunk, size - chunk);
+        await handle.read(buffer, 0, chunk, stat.size - chunk);
         const text = buffer.toString("utf8");
-        const lines = text.split(/\r?\n/).slice(size > chunk ? 1 : 0);
+        const lines = text.split(/\r?\n/).slice(stat.size > chunk ? 1 : 0);
         let running = false;
         for (const line of lines) {
           if (!line.trim()) {
@@ -513,11 +612,13 @@ export class CodexSessionStore implements ConversationStore {
             // 跳过截断或不完整的行
           }
         }
+        this.runningCache.set(filePath, { size: stat.size, mtimeMs: stat.mtimeMs, running });
         return running;
       } finally {
         await handle.close();
       }
     } catch {
+      this.runningCache.delete(filePath);
       return false;
     }
   }
@@ -713,43 +814,13 @@ export class CodexSessionStore implements ConversationStore {
 
   private async loadMessages(item: ConversationSummary): Promise<ConversationMessage[]> {
     try {
-      const stat = await fs.stat(item.sourcePath);
-      const cached = this.contentCache.get(item.sourcePath);
-      if (cached && cached.mtime === stat.mtimeMs) {
-        return cached.messages;
+      return await this.searchIndex.messagesFor(item, (record) => this.normalizeMessage(record));
+    } catch (error) {
+      if (isAbortError(error)) {
+        throw error;
       }
-      const messages = await this.readMessages(item.sourcePath);
-      this.contentCache.set(item.sourcePath, { mtime: stat.mtimeMs, messages });
-      return messages;
-    } catch {
       return [];
     }
-  }
-
-  private async readMessages(filePath: string): Promise<ConversationMessage[]> {
-    let raw: string;
-    try {
-      raw = await fs.readFile(filePath, "utf8");
-    } catch {
-      return [];
-    }
-
-    const messages: ConversationMessage[] = [];
-    for (const line of raw.split(/\r?\n/)) {
-      if (!line.trim()) {
-        continue;
-      }
-      try {
-        const parsed = JSON.parse(line) as Record<string, unknown>;
-        const message = this.normalizeMessage(parsed);
-        if (message) {
-          messages.push(message);
-        }
-      } catch {
-        // 跳过无法解析的行
-      }
-    }
-    return messages;
   }
 
   private normalizeMessage(record: Record<string, unknown>): ConversationMessage | undefined {

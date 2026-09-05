@@ -28,6 +28,7 @@ export interface SearchHit {
   text: string;
   role: "title" | "user" | "assistant";
   occurrence: number;
+  query: string;
 }
 
 export interface SearchResult {
@@ -40,10 +41,24 @@ export interface SearchResult {
   hits: SearchHit[];
 }
 
+export interface SearchProgress {
+  phase: "indexing" | "searching";
+  completed: number;
+  total: number;
+  indexed: number;
+  reused: number;
+  current?: string;
+}
+
+export interface SearchOptions {
+  signal?: AbortSignal;
+  onProgress?: (progress: SearchProgress) => void;
+}
+
 export interface ConversationStore {
   list(filter?: ArchiveFilter): Promise<ConversationSummary[]>;
   get(id: string): Promise<ConversationDetail | undefined>;
-  search(query: string): Promise<SearchResult[]>;
+  search(query: string, options?: SearchOptions): Promise<SearchResult[]>;
   delete(id: string): Promise<void>;
   rename(id: string, title: string): Promise<void>;
   unarchive(id: string): Promise<void>;
