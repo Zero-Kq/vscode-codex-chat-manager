@@ -2,7 +2,7 @@
   "name": "vscode-codex-chat-manager",
   "displayName": "Codex Chat Manager",
   "description": "在 VS Code 中浏览和管理本机 Codex 插件对话（本地使用，不上架）",
-  "version": "0.4.0",
+  "version": "0.5.0",
   "publisher": "local",
   "private": true,
   "repository": {
@@ -80,7 +80,7 @@
     "compile": "tsc -p ./",
     "watch": "tsc -watch -p ./",
     "lint": "eslint src --ext ts",
-    "test": "npm run compile && node test/search.test.js"
+    "test": "npm run compile && node test/search.test.js && node test/metadata.test.js"
   },
   "devDependencies": {
     "@types/node": "^20.17.0",

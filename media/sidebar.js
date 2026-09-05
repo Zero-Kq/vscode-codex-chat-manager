@@ -15,7 +15,8 @@ const state = {
   searchStatus: null,
   searchError: "",
   searchTerms: [],
-  searchFilters: {}
+  searchFilters: {},
+  globalTags: []
 };
 
 const listEl = document.getElementById("list");
@@ -23,6 +24,13 @@ const searchEl = document.getElementById("search");
 const menuEl = document.getElementById("menu");
 const modalEl = document.getElementById("modal");
 const modalTextEl = document.getElementById("modal-text");
+const tagMenuItemsEl = document.getElementById("tag-menu-items");
+const tagSubmenuEl = document.getElementById("tag-submenu");
+const tagSubmenuPanelEl = document.getElementById("tag-submenu-panel");
+const TAG_SUBMENU_CLOSE_DELAY_MS = 400;
+const SINGLE_CLICK_DELAY_MS = 350;
+let tagSubmenuCloseTimer = null;
+let pendingConversationClickTimer = null;
 
 function relativeTime(iso) {
   if (!iso) {
@@ -62,6 +70,9 @@ function matchesFilter(item) {
   if (state.filter === "archived" && !item.archived) {
     return false;
   }
+  if (state.filter === "favorite" && !item.favorite) {
+    return false;
+  }
   return true;
 }
 
@@ -70,14 +81,31 @@ function visibleConversations() {
 }
 
 function visibleSearchResults() {
-  if (typeof state.searchFilters.archived === "boolean") {
-    return state.searchResults;
-  }
-  return state.searchResults.filter(matchesFilter);
+  return state.searchResults.filter((item) => {
+    if (state.filter === "favorite") {
+      return Boolean(item.favorite);
+    }
+    if (typeof state.searchFilters.archived === "boolean") {
+      return true;
+    }
+    return matchesFilter(item);
+  });
 }
 
 function projectKey(item) {
-  return item.cwd || item.project || "未分类";
+  return item.projectKey || item.cwd || item.project || "未分类";
+}
+
+function timestamp(item) {
+  const value = item.updatedAt ? Date.parse(item.updatedAt) : 0;
+  return Number.isFinite(value) ? value : 0;
+}
+
+function compareItems(left, right) {
+  if (Boolean(left.favorite) !== Boolean(right.favorite)) {
+    return left.favorite ? -1 : 1;
+  }
+  return timestamp(right) - timestamp(left) || String(left.title).localeCompare(String(right.title), "zh-CN");
 }
 
 function groupedConversations() {
@@ -89,28 +117,95 @@ function groupedConversations() {
       label: item.project || "未分类",
       cwd: item.cwd || "",
       items: [],
-      latest: 0
+      latest: 0,
+      pinned: false
     };
     group.items.push(item);
-    const stamp = item.updatedAt ? Date.parse(item.updatedAt) : 0;
-    if (stamp > group.latest) {
-      group.latest = stamp;
-    }
+    group.latest = Math.max(group.latest, timestamp(item));
+    group.pinned ||= Boolean(item.pinned);
     groups.set(key, group);
   }
-  return [...groups.values()].sort((a, b) => b.latest - a.latest);
+  return [...groups.values()].sort((left, right) => {
+    if (left.pinned !== right.pinned) {
+      return left.pinned ? -1 : 1;
+    }
+    return right.latest - left.latest;
+  });
+}
+
+function groupProjectItems(items) {
+  const pinned = items.filter((item) => item.pinned).sort(compareItems);
+  const normal = items.filter((item) => !item.pinned);
+  const tagGroups = new Map();
+  const untagged = [];
+  for (const item of normal) {
+    const primaryTag = item.tags?.[0];
+    if (!primaryTag) {
+      untagged.push(item);
+      continue;
+    }
+    const group = tagGroups.get(primaryTag) ?? [];
+    group.push(item);
+    tagGroups.set(primaryTag, group);
+  }
+
+  const sections = [];
+  if (pinned.length > 0) {
+    sections.push({ key: "pinned", label: "置顶", icon: "⌖", items: pinned });
+  }
+  for (const [tag, values] of [...tagGroups.entries()].sort(([left], [right]) => left.localeCompare(right, "zh-CN"))) {
+    sections.push({ key: `tag:${tag}`, label: tag, icon: "#", items: values.sort(compareItems) });
+  }
+  if (untagged.length > 0) {
+    sections.push({ key: "untagged", label: "无标签", icon: "", items: untagged.sort(compareItems) });
+  }
+  return sections;
+}
+
+function renderNote(item) {
+  if (!item.note) {
+    return "";
+  }
+  return `<div class="item-metadata"><span class="note-preview" title="${escapeAttr(item.note)}">📝 ${escapeHtml(item.note)}</span></div>`;
 }
 
 function renderItem(item) {
-  const archivedBadge = item.archived && state.filter === "all" ? `<span class="badge">已归档</span>` : "";
+  const archivedBadge = item.archived && state.filter !== "archived" ? `<span class="badge">已归档</span>` : "";
   const runningBadge = item.running ? `<span class="running"><span class="running-dot"></span>进行中</span>` : "";
+  const favorite = item.favorite
+    ? `<span class="favorite-toggle active" data-favorite="${item.id}" role="button" tabindex="-1" title="取消收藏">★</span>`
+    : "";
+  const pin = item.pinned ? `<span class="pin-icon" title="已置顶">⌖</span>` : "";
+  const tags = (item.tags || []).map((tag) => `<span class="tag-chip" title="标签：${escapeAttr(tag)}">${escapeHtml(tag)}</span>`).join("");
+  const inlineTags = tags ? `<span class="item-tags">${tags}</span>` : "";
+  const tooltip = item.note ? `${item.title}\n备注：${item.note}` : item.title;
   return `
-    <div class="item" data-id="${item.id}" data-archived="${item.archived ? "1" : "0"}" tabindex="0" role="button">
-      <span class="title" title="${escapeAttr(item.title)}">${escapeHtml(item.title)}</span>
-      ${runningBadge}
-      ${archivedBadge}
-      <span class="time">${item.running ? "" : relativeTime(item.updatedAt)}</span>
+    <div class="item${item.pinned ? " pinned" : ""}" data-id="${item.id}" data-archived="${item.archived ? "1" : "0"}" tabindex="0" role="button" title="${escapeAttr(tooltip)}">
+      <div class="item-main">
+        ${favorite}
+        ${pin}
+        <span class="title">${escapeHtml(item.title)}</span>
+        ${runningBadge}
+        ${archivedBadge}
+        ${inlineTags}
+        <span class="time">${item.running ? "" : relativeTime(item.updatedAt)}</span>
+      </div>
+      ${renderNote(item)}
     </div>`;
+}
+
+function renderProjectSections(group) {
+  return groupProjectItems(group.items)
+    .map((section) => `
+      <div class="label-section" data-label="${escapeAttr(section.key)}">
+        <div class="label-header">
+          <span class="label-icon">${section.icon}</span>
+          <span class="label-name">${escapeHtml(section.label)}</span>
+          <span class="label-count">${section.items.length}</span>
+        </div>
+        ${section.items.map(renderItem).join("")}
+      </div>`)
+    .join("");
 }
 
 function escapeRegExp(text) {
@@ -133,6 +228,15 @@ function renderHit(result, hit) {
       <span class="hit-role">${hit.role === "user" ? "用户" : hit.role === "assistant" ? "助手" : "标题"}</span>
       <span class="hit-text">${highlightMany(hit.text, hit.query ? [hit.query] : state.searchTerms)}</span>
     </button>`;
+}
+
+function renderSearchMetadata(result) {
+  const icons = `${result.favorite ? '<span class="search-meta-icon favorite">★</span>' : ""}${result.pinned ? '<span class="search-meta-icon">⌖</span>' : ""}`;
+  const tags = (result.tags || []).map((tag) => `<span class="tag-chip">${escapeHtml(tag)}</span>`).join("");
+  if (!icons && !tags && !result.note) {
+    return "";
+  }
+  return `<div class="search-result-meta">${icons}${tags}${result.note ? `<span class="note-preview" title="${escapeAttr(result.note)}">📝 ${escapeHtml(result.note)}</span>` : ""}</div>`;
 }
 
 function renderSearch() {
@@ -167,17 +271,21 @@ function renderSearch() {
 
   const summary = `<div class="search-summary">${totalHits} 个结果，来自 ${results.length} 个对话</div>`;
   const groups = results
+    .sort((left, right) => Boolean(right.pinned) - Boolean(left.pinned))
     .map((result) => {
       const key = `search:${result.id}`;
       const collapsed = Boolean(state.collapsed[key]);
       return `
         <section class="project search-group${collapsed ? " collapsed" : ""}" data-project="${escapeAttr(key)}">
-          <button class="project-header" data-toggle-project="${escapeAttr(key)}" data-id="${result.id}" aria-expanded="${!collapsed}">
+          <button class="project-header" data-toggle-project="${escapeAttr(key)}" data-id="${result.id}" aria-expanded="${!collapsed}" title="双击在 Codex 中继续">
             <span class="chevron" aria-hidden="true"></span>
+            ${result.favorite ? '<span class="search-meta-icon favorite">★</span>' : ""}
+            ${result.pinned ? '<span class="search-meta-icon">⌖</span>' : ""}
             <span class="project-name" title="${escapeAttr(result.title)}">${highlightMany(result.title, state.searchTerms)}</span>
             ${result.running ? `<span class="running"><span class="running-dot"></span></span>` : ""}
             <span class="hit-count">${result.hits.length}</span>
           </button>
+          ${renderSearchMetadata(result)}
           <div class="project-items">
             ${result.hits.map((hit) => renderHit(result, hit)).join("")}
           </div>
@@ -187,9 +295,40 @@ function renderSearch() {
   listEl.innerHTML = summary + groups;
 }
 
+function cancelTagSubmenuClose() {
+  if (tagSubmenuCloseTimer) {
+    clearTimeout(tagSubmenuCloseTimer);
+    tagSubmenuCloseTimer = null;
+  }
+}
+
+function cancelPendingConversationClick() {
+  if (pendingConversationClickTimer) {
+    clearTimeout(pendingConversationClickTimer);
+    pendingConversationClickTimer = null;
+  }
+}
+
+function scheduleSingleConversationClick(event, action) {
+  cancelPendingConversationClick();
+  if (event.detail > 1) {
+    return;
+  }
+  pendingConversationClickTimer = setTimeout(() => {
+    pendingConversationClickTimer = null;
+    action();
+  }, SINGLE_CLICK_DELAY_MS);
+}
+
 function closeMenu() {
+  cancelTagSubmenuClose();
+  tagSubmenuEl.classList.remove("submenu-open");
   menuEl.hidden = true;
   menuEl.dataset.id = "";
+  menuEl.classList.remove("submenu-left");
+  tagSubmenuPanelEl.style.top = "";
+  tagSubmenuPanelEl.style.left = "";
+  tagSubmenuPanelEl.style.right = "";
 }
 
 function setFilter(filter) {
@@ -201,8 +340,20 @@ function setFilter(filter) {
   render();
 }
 
+function findConversation(id) {
+  return state.conversations.find((conversation) => conversation.id === id)
+    || state.searchResults.find((conversation) => conversation.id === id);
+}
+
+function setMenuLabel(action, text) {
+  const button = menuEl.querySelector(`[data-menu='${action}']`);
+  if (button) {
+    button.textContent = text;
+  }
+}
+
 function openMenu(id, x, y) {
-  const item = state.conversations.find((conversation) => conversation.id === id);
+  const item = findConversation(id);
   menuEl.dataset.id = id;
   const archiveBtn = menuEl.querySelector("[data-menu='archive']");
   const unarchiveBtn = menuEl.querySelector("[data-menu='unarchive']");
@@ -210,6 +361,18 @@ function openMenu(id, x, y) {
     archiveBtn.hidden = Boolean(item?.archived);
     unarchiveBtn.hidden = !item?.archived;
   }
+  setMenuLabel("favorite", item?.favorite ? "取消收藏" : "收藏");
+  setMenuLabel("pin", item?.pinned ? "取消置顶" : "置顶");
+  setMenuLabel("note", item?.note ? "编辑备注…" : "添加备注…");
+  const selectedTags = new Set((item?.tags || []).map((tag) => tag.toLocaleLowerCase()));
+  const availableTags = state.globalTags || [];
+  tagMenuItemsEl.innerHTML = availableTags.length > 0
+    ? availableTags.map((tag) => `
+        <button type="button" class="tag-menu-item${selectedTags.has(tag.toLocaleLowerCase()) ? " selected" : ""}" data-menu="toggleTag" data-tag="${escapeAttr(tag)}">
+          <span class="tag-menu-check">${selectedTags.has(tag.toLocaleLowerCase()) ? "✓" : ""}</span>
+          <span class="tag-menu-name">${escapeHtml(tag)}</span>
+        </button>`).join("")
+    : '<div class="menu-empty">暂无已有标签</div>';
   menuEl.hidden = false;
   const pad = 8;
   const width = menuEl.offsetWidth;
@@ -218,6 +381,38 @@ function openMenu(id, x, y) {
   const top = Math.min(y, window.innerHeight - height - pad);
   menuEl.style.left = `${Math.max(pad, left)}px`;
   menuEl.style.top = `${Math.max(pad, top)}px`;
+
+  menuEl.classList.remove("submenu-left");
+  tagSubmenuPanelEl.style.top = "-5px";
+  tagSubmenuPanelEl.style.left = "";
+  tagSubmenuPanelEl.style.right = "auto";
+  const menuRect = menuEl.getBoundingClientRect();
+  const triggerRect = tagSubmenuEl.getBoundingClientRect();
+  const panelWidth = tagSubmenuPanelEl.offsetWidth;
+  const maximumPanelLeft = Math.max(pad, window.innerWidth - pad - panelWidth);
+  const rightPanelLeft = menuRect.right - 1;
+  const leftPanelLeft = menuRect.left - panelWidth + 1;
+  const rightFits = rightPanelLeft <= maximumPanelLeft;
+  const leftFits = leftPanelLeft >= pad;
+  let panelLeft;
+  if (rightFits) {
+    panelLeft = rightPanelLeft;
+  } else if (leftFits) {
+    panelLeft = leftPanelLeft;
+  } else {
+    const rightSpace = window.innerWidth - menuRect.right;
+    const leftSpace = menuRect.left;
+    const preferredLeft = rightSpace >= leftSpace ? rightPanelLeft : leftPanelLeft;
+    panelLeft = Math.max(pad, Math.min(preferredLeft, maximumPanelLeft));
+  }
+  tagSubmenuPanelEl.style.left = `${panelLeft - triggerRect.left}px`;
+  menuEl.classList.toggle("submenu-left", panelLeft < menuRect.left);
+
+  const panelHeight = tagSubmenuPanelEl.offsetHeight;
+  const defaultPanelTop = -5;
+  const minimumTop = pad - triggerRect.top;
+  const maximumTop = window.innerHeight - pad - triggerRect.top - panelHeight;
+  tagSubmenuPanelEl.style.top = `${Math.max(minimumTop, Math.min(defaultPanelTop, maximumTop))}px`;
 }
 
 function render() {
@@ -244,7 +439,7 @@ function render() {
             <span class="project-count">${group.items.length}</span>
           </button>
           <div class="project-items">
-            ${group.items.map(renderItem).join("")}
+            ${renderProjectSections(group)}
           </div>
         </section>`;
     })
@@ -273,11 +468,11 @@ function escapeHtml(text) {
 }
 
 function escapeAttr(text) {
-  return escapeHtml(text).replace(/"/g, "&quot;");
+  return escapeHtml(text).replace(/"/g, "&quot;").replace(/\n/g, "&#10;");
 }
 
 function openDeleteModal(id) {
-  const item = state.conversations.find((conversation) => conversation.id === id);
+  const item = findConversation(id);
   if (!item) {
     return;
   }
@@ -325,6 +520,7 @@ window.addEventListener("message", (event) => {
   const message = event.data;
   if (message?.type === "conversations") {
     state.conversations = message.conversations || [];
+    state.globalTags = message.globalTags || [];
     render();
     if (state.query.trim() && !state.searchStatus && !state.searchTimer) {
       requestContentSearch();
@@ -344,6 +540,7 @@ window.addEventListener("message", (event) => {
     state.searchResults = message.results || [];
     state.searchTerms = message.terms || [];
     state.searchFilters = message.filters || {};
+    state.globalTags = message.globalTags || state.globalTags;
     state.searchStatus = null;
     state.searchError = "";
     render();
@@ -373,33 +570,67 @@ searchEl.addEventListener("input", () => {
 
 listEl.addEventListener("click", (event) => {
   closeMenu();
+  const favorite = event.target.closest("[data-favorite]");
+  if (favorite) {
+    event.stopPropagation();
+    vscode.postMessage({ type: "favorite", id: favorite.dataset.favorite });
+    return;
+  }
   const toggleBtn = event.target.closest("[data-toggle-project]");
   if (toggleBtn) {
     event.stopPropagation();
-    toggleProject(toggleBtn.dataset.toggleProject);
+    if (toggleBtn.dataset.id) {
+      const key = toggleBtn.dataset.toggleProject;
+      scheduleSingleConversationClick(event, () => toggleProject(key));
+    } else {
+      cancelPendingConversationClick();
+      toggleProject(toggleBtn.dataset.toggleProject);
+    }
     return;
   }
   const hit = event.target.closest("[data-open]");
   if (hit) {
+    const id = hit.dataset.open;
     const occurrence = Number(hit.dataset.occurrence);
     const matchedQuery = hit.dataset.query || "";
-    state.activeHit = { id: hit.dataset.open, occurrence, query: matchedQuery };
-    render();
-    vscode.postMessage({
-      type: "open",
-      id: hit.dataset.open,
-      query: matchedQuery,
-      occurrence: Number.isFinite(occurrence) ? occurrence : -1
+    scheduleSingleConversationClick(event, () => {
+      state.activeHit = { id, occurrence, query: matchedQuery };
+      render();
+      vscode.postMessage({
+        type: "open",
+        id,
+        query: matchedQuery,
+        occurrence: Number.isFinite(occurrence) ? occurrence : -1
+      });
     });
     return;
   }
   const item = event.target.closest(".item");
   if (item) {
-    vscode.postMessage({ type: "open", id: item.dataset.id, query: state.query.trim() });
+    const id = item.dataset.id;
+    const query = state.query.trim();
+    scheduleSingleConversationClick(event, () => {
+      vscode.postMessage({ type: "open", id, query });
+    });
+  }
+});
+
+listEl.addEventListener("dblclick", (event) => {
+  cancelPendingConversationClick();
+  if (event.target.closest("[data-favorite]")) {
+    return;
+  }
+  const target = event.target.closest(".item, [data-open], .search-group .project-header");
+  const id = target?.dataset.id || target?.dataset.open;
+  if (id) {
+    event.preventDefault();
+    event.stopPropagation();
+    vscode.postMessage({ type: "continue", id });
   }
 });
 
 listEl.addEventListener("contextmenu", (event) => {
+  cancelPendingConversationClick();
   const target = event.target.closest(".item, [data-open], .search-group .project-header");
   const id = target?.dataset.id || target?.dataset.open;
   if (!id) {
@@ -410,6 +641,19 @@ listEl.addEventListener("contextmenu", (event) => {
   openMenu(id, event.clientX, event.clientY);
 });
 
+tagSubmenuEl.addEventListener("pointerenter", () => {
+  cancelTagSubmenuClose();
+  tagSubmenuEl.classList.add("submenu-open");
+});
+
+tagSubmenuEl.addEventListener("pointerleave", () => {
+  cancelTagSubmenuClose();
+  tagSubmenuCloseTimer = setTimeout(() => {
+    tagSubmenuCloseTimer = null;
+    tagSubmenuEl.classList.remove("submenu-open");
+  }, TAG_SUBMENU_CLOSE_DELAY_MS);
+});
+
 menuEl.addEventListener("click", (event) => {
   const action = event.target.closest("[data-menu]");
   const id = menuEl.dataset.id;
@@ -417,25 +661,37 @@ menuEl.addEventListener("click", (event) => {
     return;
   }
   closeMenu();
-  if (action.dataset.menu === "rename") {
-    vscode.postMessage({ type: "rename", id });
+  const type = action.dataset.menu;
+  if (type === "toggleTag") {
+    vscode.postMessage({ type, id, tag: action.dataset.tag });
     return;
   }
-  if (action.dataset.menu === "archive") {
-    vscode.postMessage({ type: "archive", id });
+  if (["continue", "favorite", "pin", "newTag", "note", "rename", "archive", "unarchive"].includes(type)) {
+    vscode.postMessage({ type, id });
     return;
   }
-  if (action.dataset.menu === "unarchive") {
-    vscode.postMessage({ type: "unarchive", id });
-    return;
-  }
-  if (action.dataset.menu === "delete") {
+  if (type === "delete") {
     openDeleteModal(id);
   }
 });
 
+document.addEventListener("pointerdown", (event) => {
+  if (!event.target.closest("#menu")) {
+    closeMenu();
+  }
+}, true);
+
 document.addEventListener("click", (event) => {
   if (!event.target.closest("#menu")) {
+    closeMenu();
+  }
+});
+
+window.addEventListener("blur", closeMenu);
+window.addEventListener("resize", closeMenu);
+document.documentElement.addEventListener("mouseleave", closeMenu);
+document.addEventListener("visibilitychange", () => {
+  if (document.hidden) {
     closeMenu();
   }
 });
@@ -457,7 +713,7 @@ listEl.addEventListener("keydown", (event) => {
     return;
   }
   if (event.key === "Enter") {
-    vscode.postMessage({ type: "open", id: item.dataset.id });
+    vscode.postMessage({ type: event.ctrlKey || event.metaKey ? "continue" : "open", id: item.dataset.id });
   }
 });
 

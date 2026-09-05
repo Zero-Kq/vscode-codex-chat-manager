@@ -86,6 +86,7 @@ html, body {
 
 .filters {
   display: flex;
+  flex-wrap: wrap;
   gap: 6px;
   padding: 0 12px 8px;
 }
@@ -108,7 +109,16 @@ html, body {
 .list {
   flex: 1;
   overflow: auto;
-  padding: 0 4px 12px;
+  padding: 0 4px 6px;
+}
+
+.footer-hint {
+  flex: none;
+  padding: 5px 10px 7px;
+  color: var(--muted);
+  border-top: 1px solid color-mix(in srgb, var(--fg) 8%, transparent);
+  font-size: 10px;
+  text-align: center;
 }
 
 .project {
@@ -274,18 +284,59 @@ html, body {
   display: none;
 }
 
-.item {
+.label-section {
+  margin: 0 0 5px;
+}
+
+.label-header {
   display: flex;
   align-items: center;
-  gap: 8px;
+  gap: 5px;
+  min-height: 22px;
+  padding: 2px 8px;
+  color: var(--muted);
+  font-size: 10px;
+  text-transform: none;
+}
+
+.label-icon {
+  width: 10px;
+  color: var(--accent);
+  text-align: center;
+}
+
+.label-name {
+  overflow: hidden;
+  text-overflow: ellipsis;
+  white-space: nowrap;
+}
+
+.label-count {
+  margin-left: auto;
+  opacity: 0.72;
+}
+
+.item {
+  display: block;
   width: 100%;
   border: none;
   background: transparent;
   color: inherit;
   text-align: left;
-  padding: 8px 8px;
+  padding: 6px 8px;
   border-radius: 6px;
   cursor: pointer;
+}
+
+.item.pinned {
+  background: color-mix(in srgb, var(--accent) 7%, transparent);
+}
+
+.item-main {
+  display: flex;
+  align-items: center;
+  gap: 6px;
+  min-width: 0;
 }
 
 .item:hover,
@@ -299,6 +350,76 @@ html, body {
   text-overflow: ellipsis;
   white-space: nowrap;
   flex: 1;
+}
+
+.favorite-toggle {
+  flex: none;
+  width: 15px;
+  color: var(--vscode-charts-yellow, #cca700);
+  font-size: 14px;
+  line-height: 1;
+  text-align: center;
+}
+
+.favorite-toggle:hover,
+.favorite-toggle.active,
+.search-meta-icon.favorite {
+  color: var(--vscode-charts-yellow, #cca700);
+}
+
+.pin-icon,
+.search-meta-icon {
+  flex: none;
+  color: var(--accent);
+  font-size: 11px;
+}
+
+.item-metadata,
+.search-result-meta {
+  display: flex;
+  align-items: center;
+  gap: 4px;
+  min-width: 0;
+  margin: 4px 0 0 0;
+  overflow: hidden;
+}
+
+.search-result-meta {
+  margin: -2px 8px 5px 26px;
+}
+
+.item-tags {
+  display: flex;
+  flex: 0 1 auto;
+  align-items: center;
+  gap: 3px;
+  min-width: 0;
+  max-width: 45%;
+  overflow: hidden;
+}
+
+.tag-chip {
+  flex: none;
+  max-width: 92px;
+  overflow: hidden;
+  text-overflow: ellipsis;
+  white-space: nowrap;
+  padding: 1px 5px;
+  border: 1px solid color-mix(in srgb, var(--accent) 42%, transparent);
+  border-radius: 999px;
+  color: var(--accent);
+  background: color-mix(in srgb, var(--accent) 8%, transparent);
+  font-size: 10px;
+  line-height: 14px;
+}
+
+.note-preview {
+  min-width: 0;
+  overflow: hidden;
+  text-overflow: ellipsis;
+  white-space: nowrap;
+  color: var(--muted);
+  font-size: 10px;
 }
 
 .badge {
@@ -341,7 +462,8 @@ html, body {
 .menu {
   position: fixed;
   z-index: 20;
-  min-width: 132px;
+  min-width: 180px;
+  max-width: min(280px, calc(100vw - 16px));
   padding: 4px;
   background: var(--vscode-menu-background, var(--vscode-editorWidget-background, #252526));
   color: var(--vscode-menu-foreground, var(--fg));
@@ -377,6 +499,100 @@ html, body {
 
 .menu button.danger {
   color: var(--danger);
+}
+
+.menu-separator {
+  height: 1px;
+  margin: 4px 6px;
+  background: var(--vscode-menu-separatorBackground, color-mix(in srgb, var(--fg) 15%, transparent));
+}
+
+.menu-submenu {
+  position: relative;
+}
+
+.menu .menu-submenu-trigger {
+  display: flex;
+  align-items: center;
+  justify-content: space-between;
+  gap: 16px;
+}
+
+.menu-submenu-arrow {
+  color: var(--muted);
+  font-size: 16px;
+  line-height: 12px;
+}
+
+.menu-submenu-panel {
+  position: absolute;
+  z-index: 21;
+  top: -5px;
+  left: calc(100% - 1px);
+  width: 142px;
+  min-width: 0;
+  max-width: calc(100vw - 16px);
+  max-height: calc(100vh - 16px);
+  padding: 4px;
+  overflow: hidden;
+  visibility: hidden;
+  pointer-events: none;
+  opacity: 0;
+  background: var(--vscode-menu-background, var(--vscode-editorWidget-background, #252526));
+  color: var(--vscode-menu-foreground, var(--fg));
+  border: 1px solid var(--vscode-menu-border, var(--vscode-editorWidget-border, #454545));
+  border-radius: 6px;
+  box-shadow: 0 8px 24px rgba(0, 0, 0, 0.35);
+}
+
+.menu.submenu-left .menu-submenu-arrow {
+  transform: rotate(180deg);
+}
+
+.menu-submenu:hover > .menu-submenu-trigger,
+.menu-submenu.submenu-open > .menu-submenu-trigger,
+.menu-submenu:focus-within > .menu-submenu-trigger {
+  background: var(--vscode-menu-selectionBackground, var(--hover));
+}
+
+.menu-submenu:hover > .menu-submenu-panel,
+.menu-submenu.submenu-open > .menu-submenu-panel,
+.menu-submenu:focus-within > .menu-submenu-panel {
+  visibility: visible;
+  pointer-events: auto;
+  opacity: 1;
+}
+
+.tag-menu-items {
+  max-height: min(240px, calc(100vh - 70px));
+  overflow-y: auto;
+}
+
+.menu .tag-menu-item {
+  display: flex;
+  align-items: center;
+  gap: 4px;
+}
+
+.tag-menu-check {
+  width: 12px;
+  flex: 0 0 12px;
+  color: var(--accent);
+  font-weight: 700;
+  text-align: center;
+}
+
+.tag-menu-name {
+  min-width: 0;
+  overflow: hidden;
+  text-overflow: ellipsis;
+  white-space: nowrap;
+}
+
+.menu-empty {
+  padding: 5px 10px;
+  color: var(--muted);
+  font-size: 12px;
 }
 
 .empty {
